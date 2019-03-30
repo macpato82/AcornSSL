@@ -1,0 +1,78 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#ifndef sslmod_h
+#define sslmod_h
+
+#define MIN(a,b)  (((a)<(b))?(a):(b))
+#define MAX(a,b)  (((a)>(b))?(a):(b))
+#define UNUSED(k) (k)=(k)
+
+#define UPCALL_MAX_TIME 3000 /* cs */
+#define UPCALL_FORMAT   0
+
+/* CryptRandom module from Theo Markettos */
+#ifndef CryptRandom_Byte
+#define CryptRandom_Byte     0x51980
+#define CryptRandom_Stir     0x51981
+#define CryptRandom_AddNoise 0x51982
+#define CryptRandom_Block    0x51983
+#define CryptRandom_Word     0x51984
+#endif
+
+extern mbedtls_x509_crt        cacert_root;
+extern mbedtls_entropy_context entropy_pool;
+
+/* Error handling */
+typedef struct
+{
+	uint32_t errnum;
+	char     errmess[8];
+} internaterr_t;
+
+#define ErrorBase_HTTPS (ErrorBase_AcornURL + 0x20)
+typedef enum
+{
+	ERR00_BAD_SESSION = 0,
+	ERR01_BAD_CTX,
+	ERR02_SSL_NO_INIT,
+	ERR03_NO_DEFAULT_VERIFY_LOCATIONS,
+	ERR04_WHERES_THE_ROOTCA,
+	ERR05_MALLOC,
+	ERR06_SOCKET_ERROR,
+	ERR07_HANDSHAKE_ERROR,
+	ERR08_PARAMETER_ERROR,
+	ERR09_WHERES_THE_EXCEPTIONS
+} sslmod_err_t;
+
+void *Resources(void); /* From ResGen */
+_kernel_oserror *read_rootca(void);
+bool check_der_exception(const void *, size_t);
+_kernel_oserror *add_der_exception(const void *, size_t);
+_kernel_oserror *read_exceptions(void);
+const char *intl_lookup(const char *);
+const char *intl_integer(int32_t);
+_kernel_oserror *intl_error(sslmod_err_t, const char *);
+
+#endif

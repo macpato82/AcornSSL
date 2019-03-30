@@ -1,0 +1,64 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+; Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+
+        IMPORT  main
+        EXPORT  sslmod_enter
+
+        AREA    |confirmenter$$Data|, DATA, NOINIT, READWRITE
+
+        ; Our Wimp task's stack, put in the ZI region so it gets
+        ; released along with all the other module workspace on finalisation
+sslmod_appstack
+        SPACE   16384
+sslmod_appstacktop
+
+        AREA    |confirmenter$$Code|, CODE, READONLY
+
+        ; Entry r0  = command tail
+        ;       r12 = private word
+        ; Exit  r0  = return code from main()
+sslmod_enter
+        LDR     a4, =sslmod_appstack
+        LDR     ip, [r12]
+        LDMIB   ip, { a2-a3 }           ; Get lib & client relocation offsets
+        ADD     a4, a4, a3
+        STMIA   a4, { a2-a3 }           ; Copy to bottom of stack
+
+        ; Enter APCS main()
+        ADD     sl, a4, #540            ; Stack limit clear of the relocation offsets
+                                        ; so -536 and -540 pick them up
+        MOV     fp, #0                  ; Stop backtrace here
+        ADD     sp, a4, #sslmod_appstacktop - sslmod_appstack
+        Push    "a1"
+        MOV     a2, sp                  ; Minimal valid argc and argv
+        MOV     a1, #1
+        BL      main
+
+        SWI     OS_Exit
+
+        END

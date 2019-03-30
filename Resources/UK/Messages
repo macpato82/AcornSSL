@@ -1,0 +1,34 @@
+#{DictTokens}
+E00:Bad session handle
+E01:Bad context handle
+E02:Security libraries unable to initialise (reason %0)
+E03:Unable to initialise certificate verification procedures (reason %0)
+E04:Can't locate root certificate store
+E05:Failed to allocate memory
+E06:Socket error (code %0)
+E07:Handshake error (state %0)
+E08:Parameter error (code %0)
+E09:Can't locate certificate exceptions
+Area:Root certificates
+RejAcc:RAP
+Rej:Rejected
+Acc:Accepted
+DFmt:%d %b %Y
+To:to
+Rev:Revoked
+BadRev:Bad revocation
+BadUse:Bad usage
+UnAcc:Unacceptable
+Skip:Skipped
+Miss:Missing
+ChIntro:An attempt to make a secure connection has been stopped because the security check was unsuccessful:
+ChPrompt:It is inadvisable to continue. Reject, accept once, or permanently accept the connection (%c/%c/%c) ? 
+Ct1:Issuer
+Ct2:Subject
+Ct3:Valid from
+Ct4:Valid to
+Ct5:Serial number
+Ct6:Version
+Ct7:Signature
+Ct?/Ct??/Ct???/Ct????/Unknown:Unknown
+_TaskName:AcornSSL

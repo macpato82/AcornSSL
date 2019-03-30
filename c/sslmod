@@ -1,0 +1,572 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include "swis.h"
+
+#include "Global/NewErrors.h"
+#include "Global/Services.h"
+#include "Global/RISCOS.h"
+#include "Global/OSMem.h"
+#include "Global/ModHand.h"
+#include "Global/FileTypes.h"
+#include "Interface/URL.h"
+#include "Interface/HTTP.h"
+#include "Interface/HighFSI.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "sys/queue.h"
+#include "sys/stat.h"
+#include "tboxlibs/toolbox.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/md5.h"
+
+#include "sslmod.h"
+#include "api.h"
+#include "confirm.h"
+#include "upcalling.h"
+#include "AcornSSLHdr.h"
+#include "DebugLib/DebugLib.h"
+
+/* Global state */
+mbedtls_x509_crt        cacert_root;
+mbedtls_entropy_context entropy_pool;
+
+/* Local state */
+static uint32_t msgs_struct[4];
+static bool     callback_pending;
+static char    *exception_store;
+static size_t   exception_size;
+static char    *rootca_store;
+static size_t   rootca_area = -1;
+
+/*
+ * International support functions
+ */
+const char *intl_lookup(const char *token)
+{
+	_kernel_oserror *err;
+	static char string[128];
+
+	err = _swix(MessageTrans_Lookup, _INR(0,7),
+	            msgs_struct, token, string, sizeof(string), 0, 0, 0, 0);
+	if (err != NULL)
+	{
+		return "???";
+	}
+	return (const char *)string;
+}
+
+const char *intl_integer(int32_t value)
+{
+	_kernel_oserror *err;
+	static char string[16];
+
+	err = _swix(OS_ConvertVariform, _INR(0,4),
+	            &value, string, sizeof(string), sizeof(value), ConvertToPunctInteger);
+	if (err != NULL)
+	{
+		return "-1";
+	}
+	return (const char *)string;
+}
+
+_kernel_oserror *intl_error(sslmod_err_t which, const char *extra)
+{
+	_kernel_oserror *err;
+	internaterr_t    msg_errblk;
+
+	/* Translate via MessageTrans' internal buffer */
+	sprintf(msg_errblk.errmess, "E%02x", which);
+	msg_errblk.errnum = which + ErrorBase_HTTPS;
+	err = _swix(MessageTrans_ErrorLookup, _INR(0,7),
+	            &msg_errblk, msgs_struct, 0, 0, extra, 0, 0, 0);
+
+	return err;
+}
+
+/*
+ * Exception maintenance
+ */
+bool check_der_exception(const void *der, size_t dersize)
+{
+	uint8_t hash[16];
+	size_t  i;
+	char    match[(16 * 2)+1];
+	const char *line;
+
+	if (exception_store == NULL)
+	{
+		/* No list, no match */
+		return false;
+	}
+
+	/* Stringify the der to make comparison easier */
+	mbedtls_md5_ret((const unsigned char *)der, dersize, hash);
+	*match = '\0';
+	for (i = 0; i < sizeof(hash); i++)
+	{
+		char hex[3];
+
+		sprintf(hex, "%02x", hash[i]);
+		strcat(match, hex);
+	}
+	dprintf(("", "Looking in CertExcept for exception %s\n", match));
+
+	line = exception_store;
+	while (*line)
+	{
+		if (memcmp(line, match, 16 * 2) == 0)
+		{
+			/* It's in the list */
+			dprintf(("", "Right this way sir\n"));
+			return true;
+		}
+		line = strchr(line, '\n');
+		if (line == NULL) break;
+		line++;
+	}
+
+	return false;
+}
+
+_kernel_oserror *add_der_exception(const void *der, size_t dersize)
+{
+	uint8_t hash[16];
+	size_t  i;
+
+	/* Check for duplicates */
+	if (!check_der_exception(der, dersize))
+	{
+		char  *store;
+		size_t size;
+		bool   new = exception_store == NULL;
+
+		mbedtls_md5_ret((const unsigned char *)der, dersize, hash);
+		size = exception_size + (2 * sizeof(hash)) + 1;
+		if (new) size++; /* For a null terminator */
+		dprintf(("", "Adding CertExcept exception, now %u bytes of store\n", size));
+		store = realloc(exception_store, size);
+		if (store == NULL)
+		{
+			return intl_error(ERR05_MALLOC, NULL);
+		}
+		exception_store = store;
+		exception_size = size;
+		if (new) exception_store[0] = '\0'; /* And there it is */
+		for (i = 0; i < sizeof(hash); i++)
+		{
+			char hex[3];
+
+			sprintf(hex, "%02x", hash[i]);
+			strcat(exception_store, hex);
+		}
+		exception_store[exception_size - 2] = '\n';
+
+		/* Write out (less the trailing null) */
+		_swix(OS_File, _INR(0,1), OSFile_CreateDir, "<Choices$Write>.WWW");
+		_swix(OS_File, _INR(0,1), OSFile_CreateDir, "<Choices$Write>.WWW.AcornSSL");
+		return _swix(OS_File, _INR(0,2) | _INR(4,5), OSFile_SaveStamp,
+		                      "<Choices$Write>.WWW.AcornSSL.CertExcept",
+		                      FileType_Text, exception_store, &exception_store[exception_size - 1]);
+	}
+	return NULL;
+}
+
+static void destroy_exceptions(void)
+{
+	free(exception_store);
+	exception_store = NULL;
+}
+
+_kernel_oserror *read_exceptions(void)
+{
+	_kernel_oserror *err;
+	uint32_t size;
+	size_t   object;
+
+	/* Read in the exceptions (once), use the cached copy thereafter */
+	if (exception_store != NULL)
+	{
+		dprintf(("", "Exceptions already loaded - using that\n"));
+		return NULL;
+	}
+
+	err = _swix(OS_File, _INR(0,1) | _OUT(0) | _OUT(4),
+	            OSFile_ReadNoPath, "Choices:WWW.AcornSSL.CertExcept", &object, &size);
+	if ((err != NULL) || (object != object_file))
+	{
+		return intl_error(ERR09_WHERES_THE_EXCEPTIONS, NULL);
+	}
+	size++; /* For a null terminator */
+	exception_store = malloc(size);
+	if (exception_store == NULL)
+	{
+		return intl_error(ERR05_MALLOC, NULL);
+	}
+	exception_size = size;
+
+	/* Load it and add the terminator */
+	dprintf(("", "Loading exceptions of %u bytes\n", size));
+	err = _swix(OS_File, _INR(0,3),
+	            OSFile_LoadNoPath, "Choices:WWW.AcornSSL.CertExcept", exception_store, 0);
+	if (err != NULL) destroy_exceptions();
+	exception_store[size - 1] = '\0';
+
+	return NULL;
+}
+
+/*
+ * Root CA maintenance
+ */
+static void destroy_rootca(void)
+{
+	if (rootca_area != -1)
+	{
+		_swix(OS_DynamicArea, _INR(0,1), DAReason_Remove, rootca_area);
+		rootca_area = -1;
+	}
+	rootca_store = NULL;
+}
+
+_kernel_oserror *read_rootca(void)
+{
+	_kernel_oserror *err;
+	int      mbederr;
+	uint32_t size;
+	size_t   object;
+	static char area[32] = "";
+
+	/* Read in the root CA (once), use the cached copy thereafter */
+	if (rootca_store != NULL)
+	{
+		dprintf(("", "Root CA already loaded - using that\n"));
+		return NULL;
+	}
+
+	err = _swix(OS_File, _INR(0,1) | _OUT(0) | _OUT(4),
+	            OSFile_ReadNoPath, "InetDBase:CertData", &object, &size);
+	if ((err != NULL) || (object != object_file))
+	{
+		return intl_error(ERR04_WHERES_THE_ROOTCA, NULL);
+	}
+	dprintf(("", "Loading root CA of %u bytes\n", size));
+	size++; /* For a null terminator */
+	strncat(area, intl_lookup("Area"), sizeof(area) - 1);
+
+	/* Put them in an area so they're slightly less vulnerable than the RMA */
+	err = _swix(OS_DynamicArea, _INR(0,8) | _OUT(1) | _OUT(3),
+	            DAReason_Create, -1, size, -1,
+	            DynAreaFlags_NotUserDraggable, size, 0, 0, area,
+	            &rootca_area, &rootca_store);
+	if (err != NULL) return err;
+
+	/* Load it and add the terminator */
+	err = _swix(OS_File, _INR(0,3),
+	            OSFile_LoadNoPath, "InetDBase:CertData", rootca_store, 0);
+	if (err != NULL) destroy_rootca();
+	rootca_store[size - 1] = '\0';
+
+	/* Prepare the library's X509 context */
+	mbedtls_x509_crt_init(&cacert_root);
+	mbederr = mbedtls_x509_crt_parse(&cacert_root, (const unsigned char *)rootca_store, size);
+	dprintf(("", "X509 parse returned %d\n", mbederr));
+	if (mbederr < 0)
+	{
+		destroy_rootca();
+		err = intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
+	}
+
+	return err;
+}
+
+/*
+ * Callback once module is linked in the chain
+ */
+_kernel_oserror *callback_handler(_kernel_swi_regs *r, void *pw)
+{
+	if (callback_pending)
+	{
+		/* We've started and our SWIs are available */
+		dprintf(("", "Announce SSL started\n"));
+		_swix(OS_ServiceCall, _INR(0,2),
+		      Service_URLModule_SSL_Started, Service_URLModule_SSL, Module_VersionNumber);
+		callback_pending = false;
+	}
+	UNUSED(r);
+	UNUSED(pw);
+
+	return NULL;
+}
+
+/*
+ * Initialisation
+ */
+_kernel_oserror *sslmod_init(const char *cmd_tail, int podule_base, void *pw)
+{
+	_kernel_oserror *err;
+
+#ifndef ROM
+	err = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+	if (err != NULL)
+	{
+		return err;
+	}
+#endif
+	err = _swix(MessageTrans_OpenFile, _INR(0,2),
+	            msgs_struct, Module_MessagesFile, 0);
+	if (err != NULL) goto initdereg;
+
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(PRINTF_OUTPUT);
+
+	dprintf(("", "Look out for UpCalls\n"));
+	err = _swix(OS_Claim, _INR(0,2), UpCallV, upcall_entry, pw);
+	if (err != NULL) goto initclose;
+
+	dprintf(("", "Book callback for later announcement\n"));
+	err = _swix(OS_AddCallBack, _INR(0,1), callback_entry, pw);
+	if (err != NULL) goto initrel;
+	callback_pending = true;
+
+	/* Manually launch the Wimp task part. So that this works pre-Ursula, use
+	 * the Filer as an equivalent to StartDesktopTask via a stub.
+	 */
+	dprintf(("", "Start the Wimp module task\n"));
+	_swix(OS_CLI, _IN(0), "Filer_Run Resources:$.Resources.URL.AcornSSL.StartDAS");
+
+	dprintf(("", "Starting the entropy pool\n"));
+	mbedtls_entropy_init(&entropy_pool);
+	mbedtls_entropy_add_source(&entropy_pool, upcall_read_rand, NULL,
+	                           UPCALL_RAND_MIN, MBEDTLS_ENTROPY_SOURCE_STRONG);
+
+	UNUSED(podule_base);
+	UNUSED(cmd_tail);
+
+	return NULL;
+
+initrel:
+	_swix(OS_Release, _INR(0,2), UpCallV, upcall_entry, pw);
+initclose:
+	_swix(MessageTrans_CloseFile, _IN(0), msgs_struct);
+initdereg:
+#ifndef ROM
+	_swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+	return err;
+}
+
+/*
+ * Finalisation
+ */
+_kernel_oserror *sslmod_final(int fatal, int podule, void *pw)
+{
+	if (callback_pending)
+	{
+		_swix(OS_RemoveCallBack, _INR(0,1), callback_entry, pw);
+		callback_pending = false;
+	}
+
+	_swix(OS_Release, _INR(0,2), UpCallV, upcall_entry, pw);
+
+	if ((taskhandle != 0) && (taskhandle != -1))
+	{
+		dprintf(("", "Kill Wimp task %d\n", taskhandle));
+		_swix(Wimp_CloseDown, _INR(0,1), taskhandle, *(int *)"TASK");
+		taskhandle = 0;
+	}
+
+	dprintf(("", "Discard root CA and exceptions and entropy\n"));
+	destroy_rootca();
+	destroy_exceptions();
+	mbedtls_entropy_free(&entropy_pool);
+
+	/* Finished with the messages */
+	_swix(MessageTrans_CloseFile, _IN(0), msgs_struct);
+#ifndef ROM
+	_swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+
+	UNUSED(fatal);
+	UNUSED(podule);
+
+	return NULL;
+}
+
+/*
+ * Service call handler
+ */
+void sslmod_services(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	switch (service_number)
+	{
+#ifndef ROM
+		case Service_ResourceFSStarting:
+			/* Reregister the messages */
+			(*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+			break;
+#endif
+		case Service_URLModule_ProtocolModule:
+			if ((r->r[0] == Service_URLModule_ProtocolModule_Started) &&
+			    (r->r[3] == (HTTP_GetData & ~0x3F)))
+			{
+				/* AcornHTTP started, re-announce the availability of AcornSSL.
+				 * This ensures 'https' is available even if AcornHTTP started
+				 * afterwards (it would have missed the 'Started' service call).
+				 */
+				dprintf(("", "Service announce SSL started\n"));
+				_swix(OS_ServiceCall, _INR(0,2),
+				      Service_URLModule_SSL_Started, Service_URLModule_SSL, Module_VersionNumber);
+			}
+			break;
+
+		case Service_StartWimp:
+			if (taskhandle == 0)
+			{
+				/* Try starting once and only once */
+				taskhandle = -1;
+				r->r[0] = (int)"Desktop_AcornSSL";
+				r->r[1] = Service_Serviced;
+				dprintf(("", "Try to start Wimp task\n"));
+			}
+			break;
+
+		case Service_StartedWimp:
+			if (taskhandle == -1)
+			{
+				/* Reset failure flag for next time */
+				taskhandle = 0;
+			}
+			break;
+	}
+
+	UNUSED(pw);
+}
+
+/*
+ * Command handler
+ */
+_kernel_oserror *sslmod_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	switch (cmd_no)
+	{
+		case CMD_Desktop_AcornSSL:
+			if ((taskhandle != 0) && (taskhandle != -1))
+			{
+				internaterr_t usedesk = { 0, "UseDesk" };
+
+				/* Appear to already be running */
+				return _swix(MessageTrans_ErrorLookup, _INR(0,4), &usedesk, 0, 0, 0, Module_Title);
+			}
+			return _swix(OS_Module, _INR(0,2), ModHandReason_Enter, Module_Title, arg_string);
+
+		default:
+			return NULL;
+	}
+	UNUSED(argc);
+	UNUSED(pw);
+}
+
+/*
+ * SWI handler
+ */
+_kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+	switch (swi_offset)
+	{
+		case AcornSSL_Creat - AcornSSL_00:
+			return api_creat(/* In  */ r->r[0], r->r[1], r->r[2],
+			                 /* Out */ &r->r[0]);
+
+		case AcornSSL_Ioctl - AcornSSL_00:
+			return api_ioctl(/* In  */ r->r[0], (unsigned long)r->r[1], (void *)r->r[2],
+			                 /* Out */ &r->r[0]);
+
+		case AcornSSL_Connect - AcornSSL_00:
+			return api_connect(/* In  */ r->r[0], (const struct sockaddr *)r->r[1], r->r[2],
+			                   /* Out */ &r->r[0]);
+
+		case AcornSSL_Shutdown - AcornSSL_00:
+			return api_shutdown(/* In  */ r->r[0], r->r[1],
+			                    /* Out */ &r->r[0]);
+
+		case AcornSSL_Close - AcornSSL_00:
+			return api_close(/* In  */ r->r[0],
+			                 /* Out */ &r->r[0]);
+
+		case AcornSSL_Getsockopt - AcornSSL_00:
+			return api_getsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (void *)r->r[3], (int *)r->r[4],
+			                      /* Out */ &r->r[0]);
+
+		case AcornSSL_Write - AcornSSL_00:
+			return api_send(/* In  */ r->r[0], (const char *)r->r[1], (size_t)r->r[2], 0,
+			                /* Out */ &r->r[0]);
+
+		case AcornSSL_Recv - AcornSSL_00:
+			return api_recv(/* In  */ r->r[0], (char *)r->r[1], (size_t)r->r[2], r->r[3],
+			                /* Out */ &r->r[0]);
+
+		case AcornSSL_CreateSession - AcornSSL_00:
+			return api_createsession(/* In  */ r->r[0], (uint32_t)r->r[1],
+			                         /* Out */ &r->r[0]);
+
+		case AcornSSL_Getpeername - AcornSSL_00:
+			return api_getpeername(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (int *)r->r[2],
+			                       /* Out */ &r->r[0]);
+
+		case AcornSSL_Getsockname - AcornSSL_00:
+			return api_getsockname(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (int *)r->r[2],
+			                       /* Out */ &r->r[0]);
+
+		case AcornSSL_Setsockopt - AcornSSL_00:
+			return api_setsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (const void *)r->r[3], r->r[4],
+			                      /* Out */ &r->r[0]);
+
+		case AcornSSL_Stat - AcornSSL_00:
+			return api_stat(/* In  */ r->r[0], (struct stat *)r->r[1],
+			                /* Out */ &r->r[0]);
+
+		case AcornSSL_Version - AcornSSL_00:
+			r->r[0] = Module_VersionNumber;
+			return NULL;
+
+		case AcornSSL_Read - AcornSSL_00:
+			return api_recv(/* In  */ r->r[0], (char *)r->r[1], (size_t)r->r[2], 0,
+			                /* Out */ &r->r[0]);
+
+		case AcornSSL_Send - AcornSSL_00:
+			return api_send(/* In  */ r->r[0], (const char *)r->r[1], (size_t)r->r[2], r->r[3],
+			                /* Out */ &r->r[0]);
+	}
+	UNUSED(pw);
+
+	return error_BAD_SWI;
+}

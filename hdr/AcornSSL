@@ -1,0 +1,89 @@
+;
+; Copyright (c) 2018, RISC OS Open Ltd
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met:
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+;
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+        SUBT Exported AcornSSL constants
+
+OldOpt  SETA    {OPT}
+        OPT     OptNoList+OptNoP1List
+
+SWIClass        SETS    AcornSSLSWI_Name
+
+        ^       AcornSSLSWI_Base
+
+        AddSWI  Creat
+        AddSWI  Ioctl
+        AddSWI  Connect
+        AddSWI  Shutdown
+        AddSWI  Close
+        AddSWI  Getsockopt
+        AddSWI  Write
+        AddSWI  Recv
+        AddSWI  CreateSession
+        AddSWI  Getpeername
+        AddSWI  Getsockname
+        AddSWI  Setsockopt
+        AddSWI  Stat
+        AddSWI  Version
+        AddSWI  ConfigureSession
+        AddSWI  Read
+        AddSWI  Send
+
+; Create session flags
+                        ^ 0
+CreateSession_New       # 1
+CreateSession_CmdMask   * &FF
+CreateSession_CmdShift  * 0
+CreateSession_FlagMask  * &FFFFFF
+CreateSession_FlagShift * 8
+
+; Extension socket options to getsockopt() and setsockopt()
+                        ^ &11E0
+SO_ACORNSSL_HOSTNAME    # 1
+SO_ACORNSSL_PROMPTTIME  # 1
+
+; Certificate chain tag entries
+                        ^ 0
+CertTag_ListEnd         # 1
+CertTag_Issuer          # 1
+CertTag_Subject         # 1
+CertTag_ValidFrom       # 1
+CertTag_ValidTo         # 1
+CertTag_Serial          # 1
+CertTag_Version         # 1
+CertTag_Signature       # 1
+CertTag_X509            # 1
+
+; Certificate chain tag types
+                        ^ 0
+CertTagType_String      # 1
+CertTagType_Integer     # 1
+CertTagType_Cardinal    # 1
+CertTagType_UnixTime    # 1
+CertTagType_Pointer     # 1
+
+        OPT     OldOpt
+        END

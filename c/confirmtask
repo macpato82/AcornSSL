@@ -1,0 +1,521 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <string.h>
+#include <time.h>
+#include "swis.h"
+
+#include "Global/ModHand.h"
+#include "Global/FileTypes.h"
+#include "Interface/AcornSSL.h"
+#include "Interface/HighFSI.h"
+
+#include "sys/queue.h"
+#include "tboxlibs/toolbox.h"
+#include "tboxlibs/event.h"
+#include "tboxlibs/wimplib.h"
+#include "tboxlibs/window.h"
+#include "tboxlibs/gadgets.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/base64.h"
+
+#include "sslmod.h"
+#include "confirm.h"
+#include "DebugLib/DebugLib.h"
+
+/* Global state */
+int32_t  taskhandle;
+uint32_t taskpoll;
+struct   taskqueuelist taskqueue = SLIST_HEAD_INITIALIZER(taskqueue);
+
+#pragma check_stack /* This is the Wimp task part running in user mode */
+
+#define TRY(fn)     check_err((fn), false)
+#define TRYFAIL(fn) check_err((fn), true)
+static void check_err(_kernel_oserror *err, bool alsoexit)
+{
+	if (err != NULL)
+	{
+		wimp_report_error(err, 0, intl_lookup("_TaskName"), 0, 0, 0);
+		if (alsoexit)
+		{
+			wimp_close_down(taskhandle);
+			taskhandle = 0;
+		}
+	}
+}
+
+static void confirm_poll_close(void)
+{
+	confirmqueue_t *q, *temp;
+
+	SLIST_FOREACH_SAFE(q, &taskqueue, list, temp)
+	{
+		if ((q->dialogue != NULL_ObjectId) && (q->reply != CONFIRM_PENDING))
+		{
+			/* This dialogue has concluded */
+			toolbox_delete_object(0 /* Recurse */, q->dialogue);
+			SLIST_REMOVE(&taskqueue, q, confirmqueue_t, list);
+			free(q);
+		}
+	}
+}
+
+static char *find_nice_name(char *dst, size_t dstsize, const char *src)
+{
+	static const char *const prefix[] = { " CN=", " O=" };
+	size_t i, len;
+	char  *hit, *term;
+
+	/* Copy into a local buffer */
+	dst[0] = ' '; /* To make matching simpler */
+	strncpy(&dst[1], src, dstsize - 1); dst[dstsize - 1] = '\0';
+	for (i = 0; i < 2; i++)
+	{
+		hit = strstr(dst, prefix[i]);
+		len = strlen(prefix[i]);
+		if (hit != NULL)
+		{
+			term = &hit[len];
+			while (*term)
+			{
+				/* Terminate on NULL or comma */
+				if (*term == ',')
+				{
+					*term = '\0';
+					break;
+				}
+				term++;
+			}
+			return &hit[len];
+		}
+	}
+
+	return NULL;
+}
+
+static void *find_tag_pair(uint8_t type, uint16_t tag, const certtag_t *tags)
+{
+	while (tags->tag != CertTag_ListEnd)
+	{
+		if ((tags->tag == tag) && (tags->type == type))
+		{
+			return tags->object;
+		}
+		tags++;
+	}
+
+	return NULL;
+}
+
+static void confirm_flag_logic(ObjectId window, uint32_t flags)
+{
+	/* Use certificate flags to highlight problems */
+	if (flags & (MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE |
+	             MBEDTLS_X509_BADCERT_REVOKED | MBEDTLS_X509_BADCRL_FUTURE |
+	             MBEDTLS_X509_BADCERT_KEY_USAGE | MBEDTLS_X509_BADCERT_EXT_KEY_USAGE |
+	             MBEDTLS_X509_BADCERT_NS_CERT_TYPE))
+	{
+		TRY(button_set_value(0, window, DIALOGUE_VALIDITY_ICON, "no"));
+		if (flags & MBEDTLS_X509_BADCERT_REVOKED)
+		{
+			TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_VALIDITY_DF,
+			                           (char *)intl_lookup("Rev")));
+		}
+		if (flags & MBEDTLS_X509_BADCRL_FUTURE)
+		{
+			TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_VALIDITY_DF,
+			                           (char *)intl_lookup("BadRev")));
+		}
+		if (flags & (MBEDTLS_X509_BADCERT_KEY_USAGE |
+		             MBEDTLS_X509_BADCERT_EXT_KEY_USAGE |
+		             MBEDTLS_X509_BADCERT_NS_CERT_TYPE))
+		{
+			TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_VALIDITY_DF,
+			                           (char *)intl_lookup("BadUse")));
+		}
+	}
+	if (flags & (MBEDTLS_X509_BADCRL_NOT_TRUSTED | MBEDTLS_X509_BADCRL_EXPIRED |
+	             MBEDTLS_X509_BADCRL_BAD_MD | MBEDTLS_X509_BADCRL_BAD_PK |
+	             MBEDTLS_X509_BADCRL_BAD_KEY))
+	{
+		TRY(button_set_value(0, window, DIALOGUE_VALIDITY_ICON, "dontcare"));
+		TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_VALIDITY_DF,
+		                           (char *)intl_lookup("BadRev")));
+	}
+	if (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED)
+	{
+		TRY(button_set_value(0, window, DIALOGUE_ISSUER_ICON, "no"));
+	}
+	if (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)
+	{
+		TRY(button_set_value(0, window, DIALOGUE_SUBJECT_ICON, "dontcare"));
+	}
+	if (flags & (MBEDTLS_X509_BADCERT_BAD_MD | MBEDTLS_X509_BADCERT_BAD_PK |
+	             MBEDTLS_X509_BADCERT_BAD_KEY))
+	{
+		TRY(button_set_value(0, window, DIALOGUE_SERIAL_ICON, "no"));
+		TRY(button_set_value(0, window, DIALOGUE_SERIAL_BUTTON, (char *)intl_lookup("UnAcc")));
+	}
+	if (flags & (MBEDTLS_X509_BADCERT_MISSING | MBEDTLS_X509_BADCERT_SKIP_VERIFY |
+	             MBEDTLS_X509_BADCERT_OTHER))
+	{
+		const char *msg = NULL;
+
+		TRY(button_set_value(0, window, DIALOGUE_ISSUER_ICON, "dontcare"));
+		TRY(button_set_value(0, window, DIALOGUE_SUBJECT_ICON, "dontcare"));
+		TRY(button_set_value(0, window, DIALOGUE_VALIDITY_ICON, "no"));
+		TRY(button_set_value(0, window, DIALOGUE_SERIAL_ICON, "no"));
+		TRY(button_set_value(0, window, DIALOGUE_SIGNATURE_ICON, "no"));
+		if (flags & MBEDTLS_X509_BADCERT_OTHER) msg = intl_lookup("Unknown");
+		if (flags & MBEDTLS_X509_BADCERT_SKIP_VERIFY) msg = intl_lookup("Skip");
+		if (flags & MBEDTLS_X509_BADCERT_MISSING) msg = intl_lookup("Miss");
+		TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_VALIDITY_DF, (char *)msg));
+		TRY(button_set_value(DisplayField_Centred, window, DIALOGUE_SERIAL_BUTTON, (char *)msg));
+		TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_SIGNATURE_DF, (char *)msg));
+	}
+}
+
+static void confirm_box_populate(ObjectId window, const certtag_t *tags)
+{
+	time_t *validfrom, *validto;
+	char   *issuer, *subject, *serial, *signature;
+	union
+	{
+		char msg[256];
+		struct
+		{
+			char msg[255]; char end[1];
+		} str;
+		struct
+		{
+			char msg[128]; char vf[32]; char vt[32]; char fmt[32];
+		} date;
+	} buf;
+
+	/* Do 'Serial' */
+	serial = find_tag_pair(CertTagType_String, CertTag_Serial, tags);
+	if (serial == NULL) serial = (char *)intl_lookup("Unknown");
+	strncpy(buf.msg, serial, sizeof(buf)); *buf.str.end = '\0';
+	serial = buf.msg;
+	while (*serial)
+	{
+		if (!isxdigit(*serial)) *serial = ' ';
+		serial++;
+	}
+	TRY(button_set_value(0, window, DIALOGUE_SERIAL_BUTTON, buf.msg));
+
+	/* Do 'Issued by' */
+	issuer = find_tag_pair(CertTagType_String, CertTag_Issuer, tags);
+	if (issuer != NULL) issuer = find_nice_name(buf.msg, sizeof(buf), issuer);
+	if (issuer == NULL) issuer = (char *)intl_lookup("Unknown");
+	TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_ISSUER_DF, issuer));
+	TRY(actionbutton_set_text(0, window, DIALOGUE_ISSUER_AB, issuer));
+
+	/* Do 'Issued to' */
+	subject = find_tag_pair(CertTagType_String, CertTag_Subject, tags);
+	if (subject != NULL) subject = find_nice_name(buf.msg, sizeof(buf), subject);
+	if (subject == NULL) subject = (char *)intl_lookup("Unknown");
+	TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_SUBJECT_DF, subject));
+
+	/* Do 'Validity' */
+	strcpy(buf.date.fmt, intl_lookup("DFmt"));
+	validfrom = find_tag_pair(CertTagType_UnixTime, CertTag_ValidFrom, tags);
+	if (validfrom != NULL)
+	{
+		strftime(buf.date.vf, sizeof(buf.date.vf), buf.date.fmt, gmtime(validfrom));
+	}
+	else
+	{
+		strcpy(buf.date.vf, intl_lookup("Unknown"));
+	}
+	validto = find_tag_pair(CertTagType_UnixTime, CertTag_ValidTo, tags);
+	if (validto != NULL)
+	{
+		strftime(buf.date.vt, sizeof(buf.date.vt), buf.date.fmt, gmtime(validto));
+	}
+	else
+	{
+		strcpy(buf.date.vt, intl_lookup("Unknown"));
+	}
+	sprintf(buf.date.msg, "%s %s %s", buf.date.vf, intl_lookup("To"), buf.date.vt);
+	TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_VALIDITY_DF, buf.date.msg));
+
+	/* Do 'Signature */
+	signature = find_tag_pair(CertTagType_String, CertTag_Signature, tags);
+	if (signature == NULL) signature = (char *)intl_lookup("Unknown");
+	TRY(displayfield_set_value(DisplayField_Centred, window, DIALOGUE_SIGNATURE_DF, signature));
+}
+
+static void confirm_poll_wake(void)
+{
+	confirmqueue_t *q;
+
+	SLIST_FOREACH(q, &taskqueue, list)
+	{
+		if (q->dialogue == NULL_ObjectId)
+		{
+			const certchain_t *certs = q->chain;
+			ObjectId *id = &q->dialogue;
+			ObjectId  curr, prev = NULL_ObjectId;
+			WimpSetIconStateBlock iconstate;
+			int bytes;
+
+			/* Nest one copy of the dialogue for each certificate in the chain */
+			while (certs)
+			{
+				TRY(toolbox_create_object(0, "Certs", id));
+				TRY(toolbox_set_client_handle(0, *id, (void *)certs));
+
+				/* Justify button text to avoid warning triangle */
+				TRY(gadget_get_icon_list(0, *id, DIALOGUE_ACCEPTALWAYS_AB, &iconstate.icon_handle,
+				                         sizeof(iconstate.icon_handle), &bytes));
+				TRY(window_get_wimp_handle(0, *id, &iconstate.window_handle));
+				iconstate.EOR_word = 0;
+				iconstate.clear_word = WimpIcon_HCentred;
+				TRY(wimp_set_icon_state(&iconstate));
+
+				confirm_box_populate(*id, certs->tags);
+				confirm_flag_logic(*id, certs->flags);
+				if (certs->next == NULL)
+				{
+					/* This is the last (root) */
+					TRY(window_remove_gadget(0, *id, DIALOGUE_ISSUER_AB));
+				}
+				else
+				{
+					TRY(window_remove_gadget(0, *id, DIALOGUE_ISSUER_DF));
+				}
+				if (prev != NULL_ObjectId)
+				{
+					/* Previous issuer button should open this dialogue */
+					TRY(actionbutton_set_click_show(0, prev, DIALOGUE_ISSUER_AB, *id,
+					                                ActionButton_SetClickShow_AtPointer));
+
+					/* Only the top level has this */
+					TRY(window_remove_gadget(0, *id, DIALOGUE_ACCEPTALWAYS_AB));
+					TRY(window_remove_gadget(0, *id, DIALOGUE_ACCEPTWARN_ICON));
+				}
+				prev = *id;
+				id = &curr;
+				certs = certs->next;
+			}
+
+			/* Show the top level dialogue for the original request */
+			toolbox_show_object(0, q->dialogue, Toolbox_ShowObject_Centre,
+			                    NULL, NULL_ObjectId, NULL_ComponentId);
+		}
+	}
+
+}
+
+static _kernel_oserror *confirm_view_certificate(const certchain_t *cert)
+{
+	_kernel_oserror *err;
+	unsigned char *enc;
+	size_t   encspace, dummy;
+	uint32_t h;
+
+	/* Find how big it'll be, allocate, encode */
+	mbedtls_base64_encode(NULL, 0, &encspace, (const unsigned char *)cert->der, cert->dersize);
+	err = _swix(OS_Module, _IN(0) | _IN(3) | _OUT(2), ModHandReason_Claim, encspace, &enc);
+	if (err != NULL) return err;
+	mbedtls_base64_encode(enc, encspace, &dummy, (const unsigned char *)cert->der, cert->dersize);
+
+	/* Write out */
+	err = _swix(OS_Find, _INR(0,1) | _OUT(0), OSFind_OpenOut, "Pipe:$.AcornSSL", &h);
+	if (err == NULL)
+	{
+		_swix(OS_GBPB, _INR(0,3), OSGBPB_WriteAtPTR, h, "-----BEGIN CERTIFICATE-----\n", 28);
+		_swix(OS_GBPB, _INR(0,3), OSGBPB_WriteAtPTR, h, enc, encspace - 1);
+		_swix(OS_GBPB, _INR(0,3), OSGBPB_WriteAtPTR, h, "\n-----END CERTIFICATE-----\n", 27);
+		err = _swix(OS_Find, _INR(0,1), OSFind_Close, h);
+		if (err == NULL)
+		{
+			err = _swix(OS_File, _INR(0,2), OSFile_SetType, "Pipe:$.AcornSSL", FileType_Text);
+		}
+	}
+	_swix(OS_Module, _IN(0) | _IN(2), ModHandReason_Free, enc);
+	if (err == NULL)
+	{
+		/* Open in the default editor */
+		_swi(OS_CLI, _IN(0), "Filer_Run Pipe:$.AcornSSL");
+	}
+
+	return err;
+}
+
+static void confirm_actionbutton_selected(ToolboxEvent *event, IdBlock *id)
+{
+	const certchain_t *certs, *cert;
+	confirmqueue_t *q;
+	confirm_t       reply;
+	unsigned int    flags;
+
+	TRYFAIL(toolbox_get_client_handle(0, id->self_id, (void **)&cert));
+	switch (id->self_component)
+	{
+		case DIALOGUE_VIEW_AB:
+			TRY(confirm_view_certificate(cert));
+			return;
+
+		case DIALOGUE_ISSUER_AB:
+			/* Opening a child certificate, fade the parent's
+			 * accept button so all chain links are kept visible in order.
+			 */
+			TRY(gadget_get_flags(0, id->self_id, DIALOGUE_ACCEPT_AB, &flags));
+			flags |= Gadget_Faded;
+			TRY(gadget_set_flags(0, id->self_id, DIALOGUE_ACCEPT_AB, flags));
+
+			/* Only the top level has this */
+			gadget_get_flags(0, id->self_id, DIALOGUE_ACCEPTALWAYS_AB, &flags);
+			flags |= Gadget_Faded;
+			gadget_set_flags(0, id->self_id, DIALOGUE_ACCEPTALWAYS_AB, flags);
+			return;
+
+		case DIALOGUE_ACCEPTALWAYS_AB:
+		case DIALOGUE_ACCEPT_AB:
+			TRY(toolbox_hide_object(0, id->self_id));
+			if (id->parent_id != NULL_ObjectId)
+			{
+				/* If there's a parent, make the accept button unfaded */
+				TRY(gadget_get_flags(0, id->parent_id, DIALOGUE_ACCEPT_AB, &flags));
+				flags &= ~Gadget_Faded;
+				TRY(gadget_set_flags(0, id->parent_id, DIALOGUE_ACCEPT_AB, flags));
+
+				/* Only the top level has this */
+				gadget_get_flags(0, id->parent_id, DIALOGUE_ACCEPTALWAYS_AB, &flags);
+				flags &= ~Gadget_Faded;
+				gadget_set_flags(0, id->parent_id, DIALOGUE_ACCEPTALWAYS_AB, flags);
+				return;
+			}
+			else
+			{
+				/* It's the top level subject - accept */
+				reply = (id->self_component == DIALOGUE_ACCEPTALWAYS_AB) ? CONFIRM_ACCEPT_SAVE
+				                                                         : CONFIRM_ACCEPT;
+				break;
+			}
+
+		default:
+		case DIALOGUE_REJECT_AB:
+			/* Rejecting any link in the chain rejects the whole chain */
+			reply = CONFIRM_REJECT;
+			break;
+	}
+
+	/* Find the corresponding queue and update the reply */
+	SLIST_FOREACH(q, &taskqueue, list)
+	{
+		for (certs = q->chain; certs != NULL; certs = certs->next)
+		{
+			if (certs == cert)
+			{
+				q->reply = reply;
+				return;
+			}
+		}
+	}
+	UNUSED(event);
+}
+
+int main(int argc, char *argv[])
+{
+	static const int wimplist[] = { Wimp_MQuit,
+	                                0
+	                              };
+	static const int tboxlist[] = { Toolbox_Error,
+	                                ActionButton_Selected,
+	                                0
+	                              };
+	static const int mask = Wimp_Poll_NullMask | Wimp_Poll_RedrawWindowRequestMask |
+	                        Wimp_Poll_PointerLeavingWindowMask | Wimp_Poll_PointerEnteringWindowMask |
+	                        Wimp_Poll_MouseClickMask | Wimp_Poll_KeyPressedMask | Wimp_Poll_LoseCaretMask |
+	                        Wimp_Poll_GainCaretMask; /* Just pollword and user messages */
+	static MessagesFD msgs_struct;
+	static IdBlock    idblock;
+	bool quit = false;
+
+	TRYFAIL(toolbox_initialise(0, 310, (int *)wimplist, (int *)tboxlist,
+	                           "Resources:$.Resources.URL.AcornSSL", &msgs_struct, &idblock,
+	                           NULL, &taskhandle, NULL));
+	while (!quit)
+	{
+		WimpPollBlock poll;
+		int reason;
+
+		TRYFAIL(wimp_poll(mask | Wimp_Poll_PollWord, &poll, (int *)&taskpoll, &reason));
+		switch (reason)
+		{
+			case Wimp_EUserMessage:
+			case Wimp_EUserMessageRecorded:
+				switch (poll.user_message.hdr.action_code)
+				{
+					case Wimp_MQuit:
+						quit = true;
+						break;
+				}
+				break;
+
+			case Wimp_EToolboxEvent:
+			{
+				ToolboxEvent      *event = (ToolboxEvent *)&poll;
+				ToolboxErrorEvent *errevent = (ToolboxErrorEvent *)&poll;
+
+				switch (event->hdr.event_code)
+				{
+					case Toolbox_Error:
+						TRYFAIL((_kernel_oserror *)&errevent->errnum);
+						break;
+
+					case ActionButton_Selected:
+						confirm_actionbutton_selected(event, &idblock);
+						break;
+				}
+				break;
+			}
+
+			case Wimp_EPollWordNonZero:
+				if (taskpoll & TASKPOLL_WAKE) confirm_poll_wake();
+				if (taskpoll & TASKPOLL_CLOSE) confirm_poll_close();
+				taskpoll = 0;
+				break;
+		}
+	}
+
+	/* Exit (also triggers Toolbox to free MessagesFD and similar) */
+	wimp_close_down(taskhandle);
+	taskhandle = 0;
+
+	UNUSED(argc);
+	UNUSED(argv);
+
+	return 0;
+}

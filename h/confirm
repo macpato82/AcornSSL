@@ -1,0 +1,90 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#ifndef confirm_h
+#define confirm_h
+
+#define TASKPOLL_WAKE  1
+#define TASKPOLL_CLOSE 2
+
+/* Component refs */
+#define DIALOGUE_ISSUER_DF       0x14
+#define DIALOGUE_ISSUER_AB       0x13
+#define DIALOGUE_ISSUER_ICON     0xE
+#define DIALOGUE_SUBJECT_DF      0x9
+#define DIALOGUE_SUBJECT_ICON    0xF
+#define DIALOGUE_VALIDITY_DF     0xA
+#define DIALOGUE_VALIDITY_ICON   0x10
+#define DIALOGUE_SERIAL_BUTTON   0xD
+#define DIALOGUE_SERIAL_ICON     0x11
+#define DIALOGUE_SIGNATURE_DF    0xC
+#define DIALOGUE_SIGNATURE_ICON  0x12
+#define DIALOGUE_VIEW_AB         0x2
+#define DIALOGUE_ACCEPT_AB       0x0
+#define DIALOGUE_ACCEPTALWAYS_AB 0x17
+#define DIALOGUE_ACCEPTWARN_ICON 0x18
+#define DIALOGUE_REJECT_AB       0x1
+
+/* Certificate chain sent by UpCall */
+typedef struct
+{
+	uint8_t  type;
+	uint8_t  padding;
+	uint16_t tag;
+	void    *object;
+} certtag_t;
+
+typedef struct certchain_t
+{
+	struct certchain_t *next;
+	uint32_t    format;  /* In case the structure ever changes */
+	uint32_t    flags;   /* For this certificate */
+	const char *der;     /* Raw DER certificate */
+	size_t      dersize;
+	certtag_t   tags[1]; /* Array of these */
+} certchain_t;
+
+typedef enum
+{
+	CONFIRM_UNNECESSARY = -2, /* Internal */
+	CONFIRM_REJECT = -1, /* External */
+	CONFIRM_PENDING,
+	CONFIRM_ACCEPT,
+	CONFIRM_ACCEPT_SAVE
+} confirm_t;
+
+/* Internal queue of pending upcalls */
+typedef struct confirmqueue_t
+{
+	const certchain_t *chain;    /* One chain */
+	confirm_t          reply;    /* Confirm state of this chain */
+	ObjectId           dialogue; /* Toolbox ref */
+	SLIST_ENTRY(confirmqueue_t) list;
+} confirmqueue_t;
+
+extern int32_t  taskhandle;
+extern uint32_t taskpoll;
+extern SLIST_HEAD(taskqueuelist, confirmqueue_t) taskqueue;
+
+#endif

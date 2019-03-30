@@ -1,0 +1,442 @@
+Background
+----------
+The AcornSSL module provides a BSD-like socket interface that allows
+communication through the TCP/IP stack to resources requiring a secure
+connection.
+
+It uses the mbedTLS library for the majority of its implementation, the module
+merely calls the corresponding functions and wraps them into a set of SWIs.
+At the time of writing this supports all current SSL and TLS standards:
+
+  TLS version 1.0
+  TLS version 1.1
+  TLS version 1.2
+
+The earlier SSL version 2 and 3 standards are now deemed too insecure and are
+not supported at all, while TLS version 1.0 is likely to be withdrawn. The 
+client SWI interface offers no mechanism to select which is used, so 
+attempting to connect to a server which uses one of the insecure methods
+will fail.
+
+SWIs
+----
+AcornSSL_Creat                                                 SWI &50F80
+
+Initialises a secure session with a new socket.
+
+On entry
+   R0 = bits 0-7  : domain
+        bits 8-31 : reserved for future use (zero)
+   R1 = type
+   R2 = protocol
+
+On exit
+   R0 = ssl handle
+
+Use
+   Analogous to Socket_Creat, this SWI initialises a new secure session
+   returning a handle to use with the other SWIs. Note that the handle is
+   not a socket handle and must be treated as opaque.
+   If a socket handle (from Socket_Creat) has already been opened and
+   needs to be upgraded to a secure session, see AcornSSL_CreateSession.
+
+AcornSSL_Ioctl                                                 SWI &50F81
+
+Perform miscellaneous socket input/output control.
+
+On entry
+   R0 = ssl handle
+   R1 = operation
+   R2 = pointer to argument
+
+On exit
+   R0 = 0 for success
+   
+Use
+   Analogous to Socket_Ioctl.
+   
+AcornSSL_Connect                                               SWI &50F82
+
+Connects the secure session to a remote host.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to address structure
+   R2 = size of address structure
+
+On exit
+   R0 = 0 for success
+   
+Use
+   Analogous to Socket_Connect.
+
+AcornSSL_Shutdown                                              SWI &50F83
+
+Shut one or both halves of a connection.
+
+On entry
+   R0 = ssl handle
+   R1 = direction of shutdown
+
+On exit
+   R0 = 0 for success
+   
+Use
+   Analogous to Socket_Shutdown.
+
+AcornSSL_Close                                                 SWI &50F84
+
+Close a connection.
+
+On entry
+   R0 = ssl handle
+
+On exit
+   R0 = 0 for success
+   
+Use
+   Analogous to Socket_Close.
+
+AcornSSL_Getsockopt                                            SWI &50F85
+
+Get a socket option.
+
+On entry
+   R0 = ssl handle
+   R1 = option level
+   R2 = option
+   R3 = pointer to buffer for option value
+   R4 = size of option value buffer
+
+On exit
+   R0 = 0 for success
+   
+Use
+   Analogous to Socket_Getsockopt.
+
+AcornSSL_Write                                                 SWI &50F86
+
+Write data to a secure connection.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to data to send
+   R2 = amount of data to send
+
+On exit
+   R0 = amount of data written
+
+Use
+   Analogous to Socket_Write, equivalent to AcornSSL_Send with flags of 0.
+   See AcornSSL_Send.
+
+AcornSSL_Recv                                                  SWI &50F87
+
+Read data from a secure connection.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to data to receive
+   R2 = size of data buffer
+   R3 = option flags, only MSG_PEEK is significant
+
+On exit
+   R0 = amount of data received
+
+Use
+   Analogous to Socket_Recv.
+   While establishing a secure link, and performing a certificate exchange,
+   potentially requiring user confirmation, the link status may be reported
+   as ENOTCONN in order to match the response the Internet module would
+   give prior to a link being up.
+
+AcornSSL_CreateSession                                         SWI &50F88
+
+Initialises a secure session with an existing socket.
+
+On entry
+   R0 = socket handle from Socket_Creat
+   R1 = bits 0-7  : reason code 0, create
+        bits 8-31 : reserved for future use (zero)
+
+On exit
+   R0 = ssl handle
+
+Use
+   This SWI performs a similar function to AcornSSL_Creat, but allows the
+   caller to handover a previously opened socket.
+
+AcornSSL_Getpeername                                           SWI &50F89
+
+Get details of the remote host's address.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to address structure
+   R2 = pointer to size of address block
+
+On exit
+   R0 = 0 for success
+
+Use
+   Analogous to Socket_Getpeername.
+
+AcornSSL_Getsockname                                           SWI &50F8A
+
+Get details of the local host's address.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to address structure
+   R2 = pointer to size of address block
+
+On exit
+   R0 = 0 for success
+
+Use
+   Analogous to Socket_Getsockname.
+
+AcornSSL_Setsockopt                                            SWI &50F8B
+
+Set a socket option.
+
+On entry
+   R0 = ssl handle
+   R1 = option level
+   R2 = option
+   R3 = pointer to buffer for option value
+   R4 = size of option value buffer
+
+On exit
+   R0 = 0 for success
+   
+Use
+   Analogous to Socket_Setsockopt.
+
+AcornSSL_Stat                                                  SWI &50F8C
+
+Read status information for a socket.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to stat structure
+
+On exit
+   R0 = 0 for success
+   
+Use
+   Analogous to Socket_Stat.
+
+AcornSSL_Version                                               SWI &50F8D
+
+Read the module's version number.
+
+On exit
+   R0 = 100 * the version
+   
+Use
+   Analogous to Socket_Version.
+   If extra features are added in the future, the version number can be read
+   to determine whether the loaded version is able to support those features.
+
+AcornSSL_Read                                                  SWI &50F8E
+
+Read data from a secure connection.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to data to receive
+   R2 = size of data buffer
+
+On exit
+   R0 = amount of data received
+
+Use
+   Analogous to Socket_Read, equivalent to AcornSSL_Recv with flags of 0.
+   See AcornSSL_Recv.
+
+AcornSSL_Send                                                  SWI &50F8F
+
+Write data to a secure connection.
+
+On entry
+   R0 = ssl handle
+   R1 = pointer to data to send
+   R2 = amount of data to send
+   R3 = option flags, none are significant
+
+On exit
+   R0 = amount of data written
+
+Use
+   Analogous to Socket_Send.
+   While establishing a secure link, and performing a certificate exchange,
+   potentially requiring user confirmation, the link status may be reported
+   as ENOTCONN in order to match the response the Internet module would
+   give prior to a link being up.
+
+Commands
+--------
+No star commands are offered.
+
+Service calls
+-------------
+Service_URLModule (&83E00)
+
+This service call is issued by the AcornSSL module to communicate important
+events.
+
+SSL module became available
+
+On entry:
+   R0 = 0 (Service_URLModule_SSL_Started)
+   R1 = &83E02 (Service_URLModule_SSL)
+   R2 = version number * 100
+
+On exit:
+   All registers must be preserved. Do not claim this service call.
+
+SSL module no longer available
+
+On entry:
+   R0 = 1 (Service_URLModule_SSL_Dying)
+   R1 = &83E02 (Service_URLModule_SSL)
+   R2 = version number * 100
+
+On exit:
+   All registers must be preserved. Do not claim this service call.
+
+Extension socket options
+------------------------
+A session can be configured by calling the Getsockopt or Setsockopt SWIs
+(after Creat or CreateSession, and before Connect) to alter parameters
+relating to this specific session.
+
+Defined options are:
+
+SO_ACORNSSL_HOSTNAME (&11E0)
+   Use
+      Associates the expected name of the host with the current session.
+      Because name resolution is done by the client, and a peer can present
+      several alias names, there would otherwise be no way to cross check
+      from only the IP address whether the certificate is issued to the
+      expected name.
+      The expected name of the host will also be needed if the administrator
+      has enabled SNI (server name identification). Without this no name is
+      sent and it is likely the connection will be refused.
+      A name pointer of NULL (the default if this SWI is not called) skips
+      checking the peer's name and does not send the expected name during
+      handshaking.
+   Set
+      optval = pointer to the expected name of the host name
+      optlen = 4, the size of a string pointer
+   Get
+      optval = pointer to receive the address of the host name into
+      optlen = pointer to an integer of value 4, the size of a string pointer
+
+SO_ACORNSSL_PROMPTTIME (&11E1)
+   Use
+      Defines the amount of time the prompt will wait for if a certificate
+      is flagged as bad.
+      A value of zero will display no prompt and immediately fail the
+      connection. 
+   Set
+      optval = pointer to value in centiseconds
+      optlen = 4, the size of an integer
+   Get
+      optval = pointer to receive the integer into
+      optlen = pointer to an integer of value 4, the size of an integer pointer
+
+Loading the module
+------------------
+Application authors wanting to ensure the AcornSSL SWIs are available should
+use RMEnsure in the usual manner. For example:
+
+   RMEnsure AcornSSL 1.23 RMLoad System:Modules.Network.URL.AcornSSL
+   RMEnsure AcornSSL 1.23 Error Application requires AcornSSL 1.23 or later
+
+A more comprehensive series of RMEnsures would be needed if an earlier AcornSSL
+is loaded and has clients active; loading a second copy would end those
+sessions. In order to track security enhancements it can be assumed that the
+latest version is always better, even at the expense of terminating sessions.
+
+Note the use of System: path variable. In future the module may be made
+available with optimisations tailored for different versions of RISC OS, do
+not refer to specific versions inside !System for this reason.
+
+Starting a session
+------------------
+Which SWIs are used to get a secure connection depends on whether an insecure
+dialogue is needed prior to handshaking or not. Some protocols require an
+initial exchange to decide what to do before going secure. Since the SWIs
+provided by AcornSSL map closely to the socket SWIs that the Internet module
+provides it is convenient to look at them side by side:
+
+                                                    Commentary
+                                                    ----------
+  AcornSSL_Creat          Socket_Creat              Get a handle
+  AcornSSL_Connect        Socket_Connect            Connect to the remote host
+  :                       :
+  :                       [insecure dialogue]       Reads & writes
+  :                       :
+  :                       AcornSSL_CreateSession    Associate the handle
+  :                       :
+  [secure dialogue]       [secure dialogue]         Reads & writes
+  :                       :
+  AcornSSL_Close          AcornSSL_Close            Finish being secure
+                          Socket_Close              Close the socket
+
+Blocking versus non blocking
+----------------------------
+* Select
+  The semantics of select() require a set of bitmaps with bits relating to
+  each socket number to select on. However, ssl handles are opaque values
+  which don't contain small incrementing integers, so the macros FD_SET,
+  FD_CLR, and FD_ISSET can't be used.
+
+  If the structure of your application requires select() then the
+  recommendation is to use Socket_Creat to create the underlying socket
+  yourself then AcornSSL_CreateSession to associate the socket number with
+  and ssl handle. Since Socket_Create does return small incrementing integer
+  socket numbers these can be used with select() as normal.
+
+  Beware that a successful select() doesn't necessarily mean there is
+  application data available. Data apparently ready for reading or writing
+  on the socket may be caused by the security library handling an alert or
+  updating a session ticket. Therefore a successful select() could still
+  result in recv() or send() returning nothing.
+
+* FIONBIO command
+  Use AcornSSL_Ioctl to mark the ssl handle as non blocking by applying the
+  command FIONBIO with a pointer to an integer 1 (to enable non blocking) or 0
+  (to disable).
+  
+  Note that if this is done before connecting, the connect operation will also
+  be non blocking and will return EINPROGRESS. As noted above it isn't
+  possible to select on an ssl handle directly, so it isn't convenient to
+  find out when the connection became ready for writing. The simplest
+  workaround for this is to leave the connection as default (blocking) and
+  then use FIONBIO before reads and writes are used. Alternatively, proceed
+  anyway and expect ENOTCONN from all SWIs that need a connection: recv(),
+  send(), read(), write() and getpeername().
+
+Error reporting
+---------------
+The AcornSSL SWIs can return errors, some of which may imply a retry is
+worth considering (EINPROGRESS being one example), others fatal. These fall
+into 3 categories:
+* Propagated errors
+  Some component AcornSSL relies on has thrown an error, and you receive this,
+  for example a 'File not found' error when AcornSSL wants to read a file.
+* Unix errors
+  For maximum compatibility with the BSD sockets API, most errors returned
+  will be mapped to Unix errors in the DCI4 error range. For a full list of
+  these see 
+    C:TCPIPLibs.sys.h.errno
+  and for macros to recognise and extract them from the RISC OS error see
+    C:TCPIPLibs.sys.h.dcistructs
+* Specific errors
+  Errors in the range &813F20-813F3F are allocated to AcornSSL. These errors
+  are ones that are specific to the module but can't reasonably be given
+  a Unix error, plus any errors from SWIs that are unrelated to a BSD 
+  sockets API related call (AcornSSL_CreateSession being one example).

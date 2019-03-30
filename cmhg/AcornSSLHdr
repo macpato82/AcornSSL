@@ -1,0 +1,65 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#include "Global/Services.h"
+#include "mbedtls/ro_config.h"
+#include "VersionNum"
+
+title-string:           Module_ComponentName
+
+help-string:            Module_ComponentName Module_MajorVersion_CMHG MBEDTLS_VERSION_STRING_CMHG
+
+date-string:            Module_Date_CMHG
+
+international-help-file:"Resources:$.Resources.URL."Module_ComponentName".Messages"
+
+initialisation-code:    sslmod_init
+
+finalisation-code:      sslmod_final
+
+library-enter-code:     sslmod_enter
+module-is-runnable:
+
+command-keyword-table:  sslmod_commands
+                        Desktop_AcornSSL(min-args:0, max-args:0,
+                                         international:,
+                                         help-text:      "HDSSL",
+                                         invalid-syntax: "SDSSL")
+
+service-call-handler:   sslmod_services Service_ResourceFSStarting &83E01, /* URLProtocolModule_ProtocolModule */
+                                        Service_StartWimp Service_StartedWimp /* For Wimp task */
+
+swi-chunk-base-number:  &50F80
+
+swi-handler-code:       sslmod_swis
+
+swi-decoding-table:     AcornSSL,
+                        Creat, Ioctl, Connect, Shutdown, Close,
+                        Getsockopt, Write, Recv, CreateSession, Getpeername,
+                        Getsockname, Setsockopt, Stat, Version,
+                        Read, Send
+
+generic-veneers:        callback_entry/callback_handler
+
+vector-handlers:        upcall_entry/upcall_handler

@@ -1,0 +1,1291 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include "swis.h"
+
+#include "Global/Upcall.h"
+#include "Interface/AcornSSL.h"
+#include "AsmUtils/callbacks.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "sys/filio.h"
+#include "sys/errno.h"
+#include "sys/queue.h"
+#include "sys/dcistructs.h"
+#include "socklib.h"
+#include "inetlib.h"
+#include "tboxlibs/toolbox.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+
+#include "sslmod.h"
+#include "api.h"
+#include "confirm.h"
+#include "timelib.h"
+#include "AcornSSLHdr.h"
+#include "DebugLib/DebugLib.h"
+
+typedef struct
+{
+	mbedtls_x509_crt *crt;    /* Raw certificate */
+	uint32_t          flags;  /* Verify flags at this level */
+} certpair_t;
+
+typedef struct sslhandle_t
+{
+	mbedtls_net_context net;  /* Net context for this connection */
+	mbedtls_ssl_context ssl;  /* Secure context for this connection */
+	mbedtls_ssl_config conf;  /* Configuration of the secure context */
+	mbedtls_ctr_drbg_context ctr_drbg; /* Deterministic random byte generator (entropy) */
+
+	bool        clientsocket; /* Client opened the socket */
+	bool        connected;    /* Socket is confirmed as connected */
+	bool        nbio;         /* Socket is using non blocking IO */
+
+	uint8_t    *peekbuffer;   /* Previously peeked data */
+	size_t      peekspace;
+	size_t      peekfrom;
+	size_t      peekto;
+
+	confirm_t   confirm;      /* An unverified certificate awaits user */
+	uint32_t    confirmtime;  /* Time at which awaiting started */
+	uint32_t    confirmmax;   /* Maximum time to await */
+	size_t      confirmitt;   /* Number of times asked */
+	const certchain_t *confirmchain;
+	size_t      certs;        /* Depth of unverified certificates */
+	certpair_t  cert[MBEDTLS_X509_MAX_INTERMEDIATE_CA];
+	SLIST_ENTRY(sslhandle_t) list;
+
+	uint32_t    guard;        /* Check word */
+#define API_GUARD        0x6465624D
+#define API_GUARD_UNINIT -1
+} sslhandle_t;
+
+static SLIST_HEAD(handlelist, sslhandle_t) handles = SLIST_HEAD_INITIALIZER(handles);
+
+static _kernel_oserror *find_sslhandle(int ext, sslhandle_t **h)
+{
+	sslhandle_t *handle;
+
+	SLIST_FOREACH(handle, &handles, list)
+	{
+		if (handle == (sslhandle_t *)ext)
+		{
+			*h = handle;
+			return NULL;
+		}
+	}
+
+	return intl_error(ERR01_BAD_CTX, NULL);
+}
+
+static void debug_from_sslhandle(void *opaque, int level, const char *file, int line, const char *msg)
+{
+#ifdef DEBUGLIB
+	dprintf(("lib", "%s on session %p (in %s at line %d)\n", msg, opaque, file, line));
+#else
+	UNUSED(msg);
+	UNUSED(opaque);
+	UNUSED(file);
+	UNUSED(line);
+#endif
+	UNUSED(level);
+}
+
+static void upcall_cancel_sslhandle(sslhandle_t *h)
+{
+	_swix(OS_UpCall, _INR(0,2),
+	      UpCall_CertificateConfirmEnd, h->confirmchain, h->confirm);
+	free((void *)h->confirmchain);
+}
+
+static void upcall_crt_sslhandle(sslhandle_t *h)
+{
+	int claimed;
+
+	_swix(OS_UpCall, _INR(0,2) | _OUT(0),
+	      UpCall_CertificateConfirm, h->confirmchain, h->confirmitt,
+	      &claimed);
+	if ((claimed == CONFIRM_PENDING) || (claimed == CONFIRM_ACCEPT) || (claimed == CONFIRM_ACCEPT_SAVE))
+	{
+		h->confirm = (confirm_t)claimed;
+	}
+	else
+	{
+		/* Actively rejected, or UpCall went unclaimed */
+		h->confirm = CONFIRM_REJECT;
+	}
+	if (h->confirm != CONFIRM_PENDING)
+	{
+		upcall_cancel_sslhandle(h);
+	}
+}
+
+static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
+{
+	sslhandle_t *h = (sslhandle_t *)arg;
+
+	/* The authmode has been set to MBEDTLS_SSL_VERIFY_OPTIONAL which means
+	 * the handshake will proceed even if a link in the certificate chain is
+	 * unverified. This ensures this function is called for each link, which
+	 * we note then prompt for confirmation.
+	 * Then, at the end of handshake the verify result is checked, so
+	 * in effect the same steps as strict MBEDTLS_SSL_VERIFY_REQUIRED are
+	 * used but with a friendly prompt in between.
+	 */
+	dprintf(("lib", "server certificate check at level %d for session %p (flags = %08x)\n", depth, arg, *flags));
+	h->cert[depth].crt = crt;
+	h->cert[depth].flags = *flags;
+	h->certs++;
+	if (depth == 0)
+	{
+		size_t   i;
+		uint32_t flags = 0;
+
+		/* The peer certificate comes last, now evaluate the chain */
+		for (i = 0; i < h->certs; i++)
+		{
+			flags |= h->cert[i].flags;
+		}
+		if (check_der_exception(h->cert[0].crt->raw.p, h->cert[0].crt->raw.len))
+		{
+			/* We're blissfully ignoring this peer certificate */
+			flags = 0;
+			h->confirm = CONFIRM_ACCEPT;
+			dprintf(("lib", "exception applied to certificate\n"));
+		}
+#ifdef DEBUGCRTTASK
+#warning "Flagging all certificates, even valid ones"
+		flags = 1;
+#endif
+		if (flags)
+		{
+			size_t common, space;
+			certchain_t *anchor, *chain, *last;
+			char  temp[MBEDTLS_X509_MAX_DN_NAME_SIZE];
+			char *heap;
+
+			/* At least one test failed for at least one certificate */
+			if (h->confirmmax == 0)
+			{
+				dprintf(("lib", "not asking about certificates because timeout is zero\n"));
+				h->confirm = CONFIRM_REJECT;
+
+				return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+			}
+			dprintf(("lib", "need to ask user about certificates\n"));
+
+			/* Size up the certificate chain for UpCall */
+#define NUMTAGS   7
+#define ADDTAG(t, h, inc, _tag, _type) \
+	chain->tags[(t)].tag = (_tag); \
+	chain->tags[(t)].type = (_type); \
+	chain->tags[(t)].object = (h); \
+	(h) = (h) + (((inc) + 3) & ~3); (t) = (t) + 1;
+			common = sizeof(certchain_t) + (NUMTAGS * sizeof(certtag_t));
+			space = h->certs * common;
+			for (i = 0; i < h->certs; i++)
+			{
+				space = space +
+				        sizeof(uint32_t) /* Version */ +
+				        sizeof(time_t) /* ValidFrom */ +
+				        sizeof(time_t) /* ValidTo */ +
+				        mbedtls_x509_dn_gets(temp, sizeof(temp), &h->cert[i].crt->subject) +
+				        mbedtls_x509_dn_gets(temp, sizeof(temp), &h->cert[i].crt->issuer) +
+				        mbedtls_x509_serial_gets(temp, sizeof(temp), &h->cert[i].crt->serial) +
+				        mbedtls_x509_sig_alg_gets(temp, sizeof(temp), &h->cert[i].crt->sig_oid,
+				                                  h->cert[i].crt->sig_pk, h->cert[i].crt->sig_md,
+				                                  &h->cert[i].crt->sig_opts) +
+				        4 + 4 + 4 + 4 /* Terminate and align strings */;
+			}
+			anchor = malloc(space);
+			if (anchor == NULL)
+			{
+				/* Abandon due to lack of memory */
+				return MBEDTLS_X509_BADCERT_OTHER;
+			}
+
+			/* Build the certificate chain for UpCall */
+			chain = last = anchor;
+			heap = (char *)((uintptr_t)anchor + (h->certs * common));
+			for (i = 0; i < h->certs; i++)
+			{
+				size_t len, tag = 0;
+
+				chain->format = UPCALL_FORMAT;
+				chain->flags = h->cert[i].flags;
+				chain->der = (const char *)h->cert[i].crt->raw.p;
+				chain->dersize = h->cert[i].crt->raw.len;
+
+				len = mbedtls_x509_dn_gets(heap, sizeof(temp), &h->cert[i].crt->subject);
+				ADDTAG(tag, heap, len + 1, CertTag_Subject, CertTagType_String);
+
+				len = mbedtls_x509_dn_gets(heap, sizeof(temp), &h->cert[i].crt->issuer);
+				ADDTAG(tag, heap, len + 1, CertTag_Issuer, CertTagType_String);
+
+				*(uint32_t *)heap = h->cert[i].crt->version;
+				ADDTAG(tag, heap, sizeof(uint32_t), CertTag_Version, CertTagType_Integer);
+
+				len = mbedtls_x509_serial_gets(heap, sizeof(temp), &h->cert[i].crt->serial);
+				ADDTAG(tag, heap, len + 1, CertTag_Serial, CertTagType_String);
+
+				len = mbedtls_x509_sig_alg_gets(heap, sizeof(temp), &h->cert[i].crt->sig_oid,
+				                                h->cert[i].crt->sig_pk, h->cert[i].crt->sig_md,
+				                                &h->cert[i].crt->sig_opts);
+				ADDTAG(tag, heap, len + 1, CertTag_Signature, CertTagType_String);
+
+				*(time_t *)heap = x509_to_utc(&h->cert[i].crt->valid_from);
+				ADDTAG(tag, heap, sizeof(time_t), CertTag_ValidFrom, CertTagType_UnixTime);
+
+				*(time_t *)heap = x509_to_utc(&h->cert[i].crt->valid_to);
+				ADDTAG(tag, heap, sizeof(time_t), CertTag_ValidTo, CertTagType_UnixTime);
+
+				chain->tags[tag].tag = CertTag_ListEnd;
+				chain->next = (struct certchain_t *)((uintptr_t)chain + common);
+				last = chain;
+				chain = chain->next;
+			}
+			last->next = NULL; /* Terminate */
+			_swix(OS_ReadMonotonicTime, _OUT(0), &h->confirmtime);
+			h->confirmitt = 0;
+			h->confirmchain = anchor;
+			upcall_crt_sslhandle(h);
+		}
+	}
+
+	return 0;
+}
+
+static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
+{
+	_kernel_oserror *err;
+	int      mbederr;
+	uint32_t flags, now;
+
+	if (h->ssl.state == MBEDTLS_SSL_HANDSHAKE_OVER)
+	{
+		/* Already done */
+		return NULL;
+	}
+
+	if (!h->connected)
+	{
+		struct sockaddr_in peer;
+		int peersize = sizeof(peer);
+
+		if (getpeername(h->net.fd, (struct sockaddr *)&peer, &peersize) == -1)
+		{
+			dprintf(("api", "socket %d not yet connected\n", h->net.fd));
+			mbedtls_net_usleep(10000);
+			return &_inet_error;
+		}
+		h->connected = true;
+	}
+
+	while (1)
+	{
+		switch (h->confirm)
+		{
+			case CONFIRM_ACCEPT:
+			case CONFIRM_ACCEPT_SAVE:
+			case CONFIRM_UNNECESSARY:
+				/* Advance one step */
+				mbederr = mbedtls_ssl_handshake_step(&h->ssl);
+				break;
+
+			case CONFIRM_PENDING:
+				/* User yet to confirm certificate chain */
+				_swix(OS_ReadMonotonicTime, _OUT(0), &now);
+				if ((now - h->confirmtime) >= h->confirmmax)
+				{
+					dprintf(("api", "timed out, rejecting the bad chain\n"));
+					mbederr = MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+					h->confirm = CONFIRM_REJECT;
+					upcall_cancel_sslhandle(h);
+				}
+				else
+				{
+					mbederr = 0;
+					h->confirmitt++;
+					upcall_crt_sslhandle(h);
+				}
+				break;
+
+			default:
+			case CONFIRM_REJECT:
+				/* Bail */
+				dprintf(("api", "user rejected certificate chain\n"));
+				mbederr = MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+				break;
+		}
+
+		/* Success if zero, otherwise an error of some sort */
+		if (mbederr == 0)
+		{
+			if (h->ssl.state == MBEDTLS_SSL_HANDSHAKE_OVER)
+			{
+				dprintf(("api", "handshake completed, is %s using %s\n",
+				                mbedtls_ssl_get_version(&h->ssl),
+				                mbedtls_ssl_get_ciphersuite(&h->ssl)));
+				break;
+			}
+
+			/* Not there yet, fake a not connected error */
+			err = intl_error(ERR07_HANDSHAKE_ERROR, "-1");
+			REALLYSETDCI4ERRNO(err->errnum, ENOTCONN);
+			return err;
+		}
+		else
+		{
+			if ((mbederr != MBEDTLS_ERR_SSL_WANT_READ) &&
+			    (mbederr != MBEDTLS_ERR_SSL_WANT_WRITE))
+			{
+				dprintf(("api", "ssl_handshake_step returned %d\n", mbederr));
+				err = intl_error(ERR07_HANDSHAKE_ERROR, intl_integer(-mbederr));
+				if (mbederr == MBEDTLS_ERR_NET_CONN_RESET)
+				{
+					/* Fatal, map this to equivalent Unix error */
+					dprintf(("api", "connection terminated\n"));
+					REALLYSETDCI4ERRNO(err->errnum, ECONNRESET);
+				}
+				return err;
+			}
+
+			/* Not fatal, try again for some more */
+			usermode_donothing();
+		}
+	}
+
+	/* Remember for next time */
+	if (h->confirm == CONFIRM_ACCEPT_SAVE)
+	{
+		err = add_der_exception(h->cert[0].crt->raw.p, h->cert[0].crt->raw.len);
+		if (err != NULL)
+		{
+			return err;
+		}
+		h->confirm = CONFIRM_ACCEPT;
+	}
+
+	/* Did X509 check out OK */
+	if (h->confirm == CONFIRM_ACCEPT)
+	{
+		dprintf(("api", "ssl_get_verify_result skipped\n"));
+	}
+	else
+	{
+		flags = mbedtls_ssl_get_verify_result(&h->ssl);
+		if (flags != 0)
+		{
+			char hex[2+8+1];
+
+			dprintf(("api", "ssl_get_verify_result returned 0x%X\n", flags));
+			sprintf(hex, "0x%08X", flags);
+			return intl_error(ERR07_HANDSHAKE_ERROR, hex);
+		}
+		dprintf(("api", "verify OK too\n"));
+	}
+
+	return NULL;
+}
+
+static int modify_nonblock(mbedtls_net_context *net, bool nbio)
+{
+	if (nbio)
+	{
+		return mbedtls_net_set_nonblock(net);
+	}
+	else
+	{
+		return mbedtls_net_set_block(net);
+	}
+}
+
+static _kernel_oserror *write_to_sslhandle(sslhandle_t *h, const char *buff, size_t len,
+                                           bool nbio, int *result)
+{
+	_kernel_oserror *err = NULL;
+	int    mbederr;
+	size_t left = len;
+
+	if (nbio != h->nbio)
+	{
+		dprintf(("api", "non default FIONBIO of %d\n", nbio));
+		modify_nonblock(&h->net, nbio);
+	}
+	while (1)
+	{
+		mbederr = mbedtls_ssl_write(&h->ssl, (const unsigned char *)buff, left);
+
+		/* Success if positive, otherwise an error of some sort */
+		if (mbederr >= 0)
+		{
+			left = left - mbederr;
+			buff = buff + mbederr;
+			if (len == 0)
+			{
+				dprintf(("api", "sent an empty application record\n"));
+			}
+			*result = len - left;
+			break;
+		}
+		else
+		{
+			if ((mbederr != MBEDTLS_ERR_SSL_WANT_READ) &&
+			    (mbederr != MBEDTLS_ERR_SSL_WANT_WRITE))
+			{
+				dprintf(("api", "ssl_write returned %d\n", mbederr));
+				*result = -1;
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				break;
+			}
+
+			if (nbio && ((mbederr == MBEDTLS_ERR_SSL_WANT_READ) ||
+			             (mbederr == MBEDTLS_ERR_SSL_WANT_WRITE)))
+			{
+				dprintf(("api", "ssl_write would block\n"));
+				*result = -1;
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				REALLYSETDCI4ERRNO(err->errnum, EWOULDBLOCK);
+				break;
+			}
+		}
+
+		/* Not fatal, try again for some more */
+		usermode_donothing();
+	}
+	dprintf(("gbpb", "wrote %d bytes\n", *result));
+	if (nbio != h->nbio)
+	{
+		dprintf(("api", "restored FIONBIO\n"));
+		modify_nonblock(&h->net, h->nbio);
+	}
+
+	return err;
+}
+
+static _kernel_oserror *read_from_sslhandle(sslhandle_t *h, char *buff, size_t len,
+                                            bool nbio, int *result)
+{
+	_kernel_oserror *err = NULL;
+	int    mbederr;
+	size_t left = len;
+
+	if (nbio != h->nbio)
+	{
+		dprintf(("api", "non default FIONBIO of %d\n", nbio));
+		modify_nonblock(&h->net, nbio);
+	}
+	while (1)
+	{
+		mbederr = mbedtls_ssl_read(&h->ssl, (unsigned char *)buff, left);
+
+		/* Success if positive, otherwise an error of some sort */
+		if (mbederr >= 0)
+		{
+			left = left - mbederr;
+			buff = buff + mbederr;
+			if (mbederr == 0)
+			{
+				dprintf(("api", "peer reached EOF after %d bytes\n", len - left));
+			}
+			*result = len - left;
+			break;
+		}
+		else
+		{
+			if ((mbederr != MBEDTLS_ERR_SSL_WANT_READ) &&
+			    (mbederr != MBEDTLS_ERR_SSL_WANT_WRITE) &&
+			    (mbederr != MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY))
+			{
+				dprintf(("api", "ssl_read returned %d\n", mbederr));
+				*result = -1;
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				break;
+			}
+
+			if (nbio && ((mbederr == MBEDTLS_ERR_SSL_WANT_READ) ||
+			             (mbederr == MBEDTLS_ERR_SSL_WANT_WRITE)))
+			{
+				dprintf(("api", "ssl_read would block\n"));
+				*result = -1;
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				REALLYSETDCI4ERRNO(err->errnum, EWOULDBLOCK);
+				break;
+			}
+
+			if (mbederr == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY)
+			{
+				dprintf(("api", "peer closed after %d bytes\n", len - left));
+				*result = len - left;
+				break;
+			}
+		}
+
+		/* Not fatal, try again for some more */
+		usermode_donothing();
+	}
+	dprintf(("gbpb", "read %d bytes\n", *result));
+	if (nbio != h->nbio)
+	{
+		dprintf(("api", "restored FIONBIO\n"));
+		modify_nonblock(&h->net, h->nbio);
+	}
+
+	return err;
+}
+
+static _kernel_oserror *common_conf_sslhandle(sslhandle_t *h, bool client)
+{
+	int mbederr;
+	int endpoint = client ? MBEDTLS_SSL_IS_CLIENT
+	                      : MBEDTLS_SSL_IS_SERVER;
+
+	/* Prefill most of the config structure */
+	mbederr = mbedtls_ssl_config_defaults(&h->conf,
+	                                      endpoint,
+	                                      MBEDTLS_SSL_TRANSPORT_STREAM,
+	                                      MBEDTLS_SSL_PRESET_DEFAULT);
+	if (mbederr != 0)
+	{
+		dprintf(("api", "ssl_config_defaults returned %d\n", mbederr));
+		return intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
+	}
+
+	/* Certificate checking config */
+	mbedtls_ssl_conf_authmode(&h->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+	mbedtls_ssl_conf_verify(&h->conf, note_crt_sslhandle, h);
+	mbedtls_ssl_conf_ca_chain(&h->conf, &cacert_root, NULL);
+
+	/* RNG config */
+	mbedtls_ssl_conf_rng(&h->conf, mbedtls_ctr_drbg_random, &h->ctr_drbg);
+
+	/* Debug config */
+	dprintf(("api", "attaching debug for session %p\n", (void *)h));
+	mbedtls_ssl_conf_dbg(&h->conf, debug_from_sslhandle, h);
+
+	/* Copy the config into the SSL context */
+	mbederr = mbedtls_ssl_setup(&h->ssl, &h->conf);
+	if (mbederr != 0)
+	{
+		dprintf(("api", "ssl_setup returned %d\n", mbederr));
+		return intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
+	}
+
+	/* Hook up basic IO for the library to do handshake with */
+	mbedtls_ssl_set_bio(&h->ssl, &h->net, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+	return NULL;
+}
+
+static _kernel_oserror *free_sslhandle(sslhandle_t *h)
+{
+	/* Handle, h, has already been validated */
+	if (h->guard == API_GUARD)
+	{
+		SLIST_REMOVE(&handles, h, sslhandle_t, list);
+		h->guard = API_GUARD_UNINIT;
+	}
+
+	/* Finalise each library sub component */
+	dprintf(("api", "finishing with session at %p\n", (void *)h));
+	mbedtls_net_init(&h->net);
+	mbedtls_ssl_free(&h->ssl);
+	mbedtls_ssl_config_free(&h->conf);
+	mbedtls_ctr_drbg_free(&h->ctr_drbg);
+
+	free(h->peekbuffer);
+	free(h);
+
+	return NULL;
+}
+
+static _kernel_oserror *new_sslhandle(sslhandle_t **h)
+{
+	sslhandle_t *new;
+
+	new = (sslhandle_t *)malloc(sizeof(sslhandle_t));
+	if (new != NULL)
+	{
+		int mbederr;
+		_kernel_oserror *err;
+
+		/* Initially invalid */
+		new->guard = API_GUARD_UNINIT;
+
+		/* Initially unconnected */
+		new->connected = false;
+
+		/* Nothing peeked */
+		new->peekbuffer = NULL;
+		new->peekspace = 0;
+		new->peekfrom = new->peekto = 0;
+
+		/* Initialise each library sub component */
+		dprintf(("api", "initialise session at %p\n", (void *)new));
+		mbedtls_net_init(&new->net);
+		mbedtls_ssl_init(&new->ssl);
+		mbedtls_ssl_config_init(&new->conf);
+		mbedtls_ctr_drbg_init(&new->ctr_drbg);
+		mbederr = mbedtls_ctr_drbg_seed(&new->ctr_drbg,
+		                                mbedtls_entropy_func, &entropy_pool,
+		                                (const unsigned char *)Module_Title, sizeof(Module_Title) - 1);
+		if (mbederr != 0)
+		{
+			dprintf(("api", "ctr_drbg_seed returned %d\n", mbederr));
+			free_sslhandle(new);
+			return intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
+		}
+
+		/* Ensure the certificates are initialised */
+		err = read_rootca();
+		if (err != NULL)
+		{
+			dprintf(("api", "failed reading root CA %s\n", err->errmess));
+			free_sslhandle(new);
+			return err;
+		}
+		new->certs = 0;
+		new->confirm = CONFIRM_UNNECESSARY;
+		new->confirmmax = UPCALL_MAX_TIME;
+
+		/* Ensure exceptions are initialised, can carry on if error */
+		read_exceptions();
+
+		/* Good session created, add to the list */
+		new->guard = API_GUARD;
+		SLIST_INSERT_HEAD(&handles, new, list);
+		*h = new;
+		return NULL;
+	}
+
+	return intl_error(ERR05_MALLOC, NULL);
+}
+
+/*!
+ * \param  domain As for Socket_Creat, with spare flags
+ * \param  type As for Socket_Creat
+ * \param  protocol As for Socket_Creat
+ * \param  result Pointer to return result (an opaque SSL handle)
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_creat(int domain, int type, int protocol,
+                           int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = new_sslhandle(&h);
+	if (err != NULL) return err;
+	err = common_conf_sslhandle(h, true);
+	if (err == NULL)
+	{
+		int s;
+
+		if ((domain >> CreateSession_FlagShift) & CreateSession_FlagMask)
+		{
+			/* All flags currently reserved for future use */
+			dprintf(("api", "bad flags %08x to Creat\n", domain));
+			err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+			REALLYSETDCI4ERRNO(err->errnum, EINVAL);
+
+			return err;
+		}
+		s = socket(domain, type, protocol);
+		if (s == -1)
+		{
+			free_sslhandle(h);
+			return &_inet_error;
+		}
+		dprintf(("api", "socket %d associated with SSL handle %p\n", s, (void *)h));
+		h->net.fd = s;
+		h->clientsocket = false;
+		*result = (int)h;
+	}
+
+	return err;
+}
+
+/*!
+ * \param  s Existing socket opened via Socket SWIs
+ * \param  flags Option flags
+ * \param  result Pointer to return result (an opaque SSL handle)
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_createsession(int s, uint32_t flags,
+                                   int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	if ((((flags >> CreateSession_CmdShift) & CreateSession_CmdMask) != CreateSession_New) ||
+	    (((flags >> CreateSession_FlagShift) & CreateSession_FlagMask) != 0))
+	{
+		dprintf(("api", "bad flags %08x to CreateSession\n", flags));
+		err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+		REALLYSETDCI4ERRNO(err->errnum, EINVAL);
+
+		return err;
+	}
+
+	err = new_sslhandle(&h);
+	if (err != NULL) return err;
+	err = common_conf_sslhandle(h, true);
+	if (err == NULL)
+	{
+		dprintf(("api", "existing socket %d associated with SSL handle %p\n", s, (void *)h));
+		h->net.fd = s;
+		h->clientsocket = true;
+		*result = (int)h;
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  name As for Socket_Connect
+ * \param  namelen As for Socket_Connect
+ * \param  result Pointer to return result as for Socket_Connect
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_connect(int ext, const struct sockaddr *name, int namelen,
+                             int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		*result = connect(h->net.fd, name, namelen);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			dprintf(("api", "connect %p complete\n", (void *)h));
+			h->connected = true;
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  how As for Socket_Shutdown
+ * \param  result Pointer to return result as for Socket_Shutdown
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_shutdown(int ext, int how,
+                              int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		*result = shutdown(h->net.fd, how);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			dprintf(("api", "shutdown of %p\n", (void *)h));
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  result Pointer to return result as for Socket_Close
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_close(int ext,
+                           int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		mbedtls_ssl_close_notify(&h->ssl);
+		*result = h->clientsocket ? 0
+		                          : socketclose(h->net.fd);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			/* Also dispose of the memory associated with the handle */
+			dprintf(("api", "close of %p\n", (void *)h));
+			h->net.fd = -1;
+			err = free_sslhandle(h);
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  buff As for Socket_Send
+ * \param  len As for Socket_Send
+ * \param  flags As for Socket_Send
+ * \param  result Pointer to return result as for Socket_Write
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_send(int ext, const char *buff, size_t len, int flags,
+                          int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+	bool   dontwait, waitall, nbio;
+
+	*result = -1;
+	err = find_sslhandle(ext, &h);
+	if (err != NULL) return err;
+	err = handshake_sslhandle(h);
+	if (err != NULL) return err;
+
+	/* Deduce the local message options */
+	dontwait = (flags & MSG_DONTWAIT) != 0;
+	waitall = (flags & MSG_WAITALL) != 0;
+	nbio = (dontwait != waitall) ? dontwait : h->nbio;
+
+	return write_to_sslhandle(h, buff, len, nbio, result);
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  buff As for Socket_Recv
+ * \param  len As for Socket_Recv
+ * \param  flags As for Socket_Recv
+ * \param  result Pointer to return result as for Socket_Recv
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_recv(int ext, char *buff, size_t len, int flags,
+                          int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+	bool   dontwait, waitall, nbio;
+
+	*result = -1;
+	err = find_sslhandle(ext, &h);
+	if (err != NULL) return err;
+	err = handshake_sslhandle(h);
+	if (err != NULL) return err;
+
+	/* Deduce the local message options */
+	dontwait = (flags & MSG_DONTWAIT) != 0;
+	waitall = (flags & MSG_WAITALL) != 0;
+	nbio = (dontwait != waitall) ? dontwait : h->nbio;
+
+	if (flags & MSG_PEEK)
+	{
+		int      read;
+		size_t   available = h->peekto - h->peekfrom;
+		uint8_t *newbuffer;
+
+		if (len > available)
+		{
+			/* Flatten existing buffer */
+			memmove(h->peekbuffer, h->peekbuffer + h->peekfrom, available);
+			h->peekfrom = 0;
+			h->peekto = available;
+			dprintf(("gbpb", "peek buffer contains %u bytes, peeking %u\n", available, len));
+
+			/* Grow then fetch into the buffer */
+			newbuffer = realloc(h->peekbuffer, len);
+			if (newbuffer == NULL)
+			{
+				return intl_error(ERR05_MALLOC, NULL);
+			}
+			else
+			{
+				h->peekbuffer = newbuffer;
+				h->peekspace = len;
+				err = read_from_sslhandle(h, (char *)h->peekbuffer + available,
+				                          len - available, nbio, &read);
+				if (available && (read < 0))
+				{
+					/* The read failed, but there's something buffered. Ignore
+					 * the error and instead pass back what little is available.
+					 */
+					read = 0;
+					err = NULL;
+				}
+				if (err != NULL) return err;
+				if (read < 0) return NULL;
+
+				/* Accumulate new peeked data */
+				h->peekto += read;
+				available += read;
+			}
+		}
+
+		/* Give as much as possible from previously peeked data */
+		len = MIN(len, available);
+		memcpy(buff, h->peekbuffer + h->peekfrom, len);
+		dprintf(("gbpb", "peeked %d bytes\n", len));
+		*result = len;
+		err = NULL;
+	}
+	else
+	{
+		int    read;
+		size_t available = h->peekto - h->peekfrom;
+		size_t copy = 0;
+
+		if (available)
+		{
+			/* Consume from peeked data first */
+			copy = MIN(len, available);
+			memcpy(buff, h->peekbuffer + h->peekfrom, copy);
+			dprintf(("gbpb", "peek buffer contains %u bytes, still want %u\n", available, len - copy));
+			h->peekfrom += copy;
+			if (h->peekto - h->peekfrom == 0)
+			{
+				/* All consumed */
+				dprintf(("gbpb", "peek buffer became empty\n"));
+				free(h->peekbuffer);
+				h->peekbuffer = NULL;
+				h->peekspace = h->peekto = h->peekfrom = 0;
+			}
+			if (len == copy)
+			{
+				*result = copy;
+				return NULL;
+			}
+
+			/* Need to read the remaining */
+			buff += copy;
+			len  -= copy;
+		}
+		err = read_from_sslhandle(h, buff, len, nbio, &read);
+		if (copy && (read < 0))
+		{
+			/* The read failed, but there's something buffered. Ignore
+			 * the error and instead pass back what little is available.
+			 */
+			read = 0;
+			err = NULL;
+		}
+		if (err != NULL) return err;
+		if (read < 0) return NULL;
+
+		/* Add to any read earlier */
+		*result = copy + read;
+	}
+
+	return NULL;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  cmd As for Socket_Ioctl
+ * \param  arg As for Socket_Ioctl
+ * \param  result Pointer to return result as for Socket_Ioctl
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_ioctl(int ext, unsigned long cmd, void *arg,
+                           int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		if (cmd == _IOW('f', 126, int))
+		{
+			/* Track writes to FIONBIO */
+			h->nbio = *(int *)arg != 0;
+			dprintf(("api", "nbio set to %d on %p\n", h->nbio, (void *)h));
+			*result = modify_nonblock(&h->net, h->nbio);
+		}
+		else
+		{
+			*result = socketioctl(h->net.fd, cmd, arg);
+		}
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			dprintf(("api", "ioctl %lu on %p\n", cmd & 0xFF, (void *)h));
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  name As for Socket_Getpeername
+ * \param  namelen As for Socket_Getpeername
+ * \param  result Pointer to return result as for Socket_Getpeername
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_getpeername(int ext, struct sockaddr *name, int *namelen,
+                                 int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		*result = getpeername(h->net.fd, name, namelen);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			struct sockaddr_in *in = (struct sockaddr_in *)name;
+
+			dprintf(("api", "getpeername %s on %p\n", inet_ntoa(in->sin_addr), (void *)h));
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  name As for Socket_Getsockname
+ * \param  namelen As for Socket_Getsockname
+ * \param  result Pointer to return result as for Socket_Getsockname
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_getsockname(int ext, struct sockaddr *name, int *namelen,
+                                 int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		*result = getsockname(h->net.fd, name, namelen);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			struct sockaddr_in *in = (struct sockaddr_in *)name;
+
+			dprintf(("api", "getsockname %s on %p\n", inet_ntoa(in->sin_addr), (void *)h));
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  level As for Socket_Getsockopt
+ * \param  optname As for Socket_Getsockopt
+ * \param  optval As for Socket_Getsockopt
+ * \param  optlen As for Socket_Getsockopt
+ * \param  result Pointer to return result as for Socket_Getsockopt
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, int *optlen,
+                                int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		if ((optname == SO_ACORNSSL_HOSTNAME) && (level == SOL_SOCKET))
+		{
+			/* Session host name */
+			if (*optlen != sizeof(char *))
+			{
+				*result = -1;
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+			}
+			else
+			{
+				*result = ESUCCESS;
+				*(char **)optval = h->ssl.hostname;
+			}
+			return err;
+		}
+		if ((optname == SO_ACORNSSL_PROMPTTIME) && (level == SOL_SOCKET))
+		{
+			/* Prompt timeout in centiseconds for flagged certificates */
+			if (*optlen != sizeof(uint32_t))
+			{
+				*result = -1;
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+			}
+			else
+			{
+				*result = ESUCCESS;
+				*(uint32_t *)optval = h->confirmmax;
+			}
+			return err;
+		}
+		*result = getsockopt(h->net.fd, level, optname, optval, optlen);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			if (*optlen == sizeof(int)) dprintf(("api", "value %d from ", *(int *)optval));
+			dprintf(("api", "getsockopt %d on %p\n", optname, (void *)h));
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  level As for Socket_Setsockopt
+ * \param  optname As for Socket_Setsockopt
+ * \param  optval As for Socket_Setsockopt
+ * \param  optlen As for Socket_Setsockopt
+ * \param  result Pointer to return result as for Socket_Setsockopt
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *optval, int optlen,
+                                int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		if ((optname == SO_ACORNSSL_HOSTNAME) && (level == SOL_SOCKET))
+		{
+			int mbederr;
+
+			/* Session host name */
+			if (optlen != sizeof(const char *))
+			{
+				*result = -1;
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+			}
+			else
+			{
+				*result = ESUCCESS;
+				mbederr = mbedtls_ssl_set_hostname(&h->ssl, (const char *)optval);
+				if (mbederr < 0)
+				{
+					*result = -1;
+					if (mbederr == MBEDTLS_ERR_SSL_ALLOC_FAILED)
+					{
+						return intl_error(ERR05_MALLOC, NULL);
+					}
+
+					/* Treat everything else as invalid parameter */
+					err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+					REALLYSETDCI4ERRNO(err->errnum, EINVAL);
+				}
+			}
+			return err;
+		}
+		if ((optname == SO_ACORNSSL_PROMPTTIME) && (level == SOL_SOCKET))
+		{
+			/* Prompt timeout in centiseconds for flagged certificates */
+			if (optlen != sizeof(uint32_t))
+			{
+				*result = -1;
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+			}
+			else
+			{
+				*result = ESUCCESS;
+				h->confirmmax = *(uint32_t *)optval;
+			}
+			return err;
+		}
+		*result = setsockopt(h->net.fd, level, optname, optval, optlen);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			if (optlen == sizeof(int)) dprintf(("api", "value %d to ", *(const int *)optval));
+			dprintf(("api", "setsockopt %d on %p\n", optname, (void *)h));
+		}
+	}
+
+	return err;
+}
+
+/*!
+ * \param  ext Opaque SSL handle from AcornSSL_Creat or AcornSSL_CreateSession
+ * \param  buf As for Socket_Stat
+ * \param  result Pointer to return result as for Socket_Stat
+ * \return Pointer to error block
+ */
+_kernel_oserror *api_stat(int ext, struct stat *buf,
+                          int *result)
+{
+	sslhandle_t     *h;
+	_kernel_oserror *err;
+
+	err = find_sslhandle(ext, &h);
+	if (err == NULL)
+	{
+		*result = socketstat(h->net.fd, buf);
+		if (*result == -1)
+		{
+			err = &_inet_error;
+		}
+		else
+		{
+			dprintf(("api", "stat st_blksize %ld for %p\n", buf->st_blksize, (void *)h));
+		}
+	}
+
+	return err;
+}

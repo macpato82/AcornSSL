@@ -1,0 +1,261 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+#include "swis.h"
+
+#include "Global/OsBytes.h"
+#include "Global/Upcall.h"
+#include "Interface/AcornSSL.h"
+
+#include "sys/queue.h"
+#include "tboxlibs/toolbox.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+
+#include "sslmod.h"
+#include "confirm.h"
+#include "upcalling.h"
+#include "AcornSSLHdr.h"
+#include "DebugLib/DebugLib.h"
+
+/* Local state */
+static int randwords[UPCALL_RAND_MIN / sizeof(int)];
+static size_t randword;
+
+/*
+ * UpCall if certificate needs confirmation during handshake
+ */
+static int upcall_desktop_confirm(const certchain_t *certs, size_t itt)
+{
+	if (itt == 0)
+	{
+		confirmqueue_t *new;
+
+		new = (confirmqueue_t *)malloc(sizeof(confirmqueue_t));
+		if (new != NULL)
+		{
+			/* Queue this question and wake the Wimp task */
+			new->chain = certs;
+			new->reply = CONFIRM_PENDING;
+			new->dialogue = NULL_ObjectId;
+			SLIST_INSERT_HEAD(&taskqueue, new, list);
+			taskpoll |= TASKPOLL_WAKE;
+		}
+		return CONFIRM_PENDING;
+	}
+	else
+	{
+		confirmqueue_t *q;
+
+		SLIST_FOREACH(q, &taskqueue, list)
+		{
+			if (q->chain == certs)
+			{
+				/* Still in the queue, give latest state */
+				return q->reply;
+			}
+		}
+		return CONFIRM_REJECT;
+	}
+}
+
+static int upcall_cli_confirm(const certchain_t *certs, size_t itt)
+{
+	const char *ucase, *options = intl_lookup("RejAcc");
+	char reject, accept, perm;
+	int  key, qualifier, result = CONFIRM_REJECT;
+	_kernel_oserror *err;
+
+	/* International equivalents */
+	reject = options[0];
+	accept = options[1];
+	perm   = options[2];
+	err = _swix(Territory_UpperCaseTable, _IN(0) | _OUT(0), -1, &ucase);
+	if (err != NULL) ucase = NULL;
+
+	if (itt == 0)
+	{
+		/* First time round at the command line, write out the chain */
+		printf("\n%s\n", intl_lookup("ChIntro"));
+		while (certs)
+		{
+			const char downarrow = 138; /* System font */
+			const certtag_t *tag = certs->tags;
+			char  token[8];
+
+			printf(" %c\n", downarrow);
+			while (tag->tag != CertTag_ListEnd)
+			{
+				sprintf(token, "Ct%hx", tag->tag);
+				printf(" %s: ", intl_lookup(token));
+				switch (tag->type)
+				{
+					case CertTagType_Cardinal:
+						printf("%u\n", *(uint32_t *)tag->object);
+						break;
+
+					case CertTagType_Integer:
+						printf("%d\n", *(int32_t *)tag->object);
+						break;
+
+					case CertTagType_String:
+						printf("%s\n", (const char *)tag->object);
+						break;
+
+					case CertTagType_UnixTime:
+						printf("%s", asctime(gmtime((time_t *)tag->object)));
+						break;
+				}
+				tag++;
+			}
+			certs = certs->next;
+		}
+		printf(intl_lookup("ChPrompt"), reject, accept, perm);
+	}
+
+	/* Wait for for user input */
+	err = _swix(OS_Byte, _INR(0,2) | _OUTR(1,2), OsByte_INKEY,
+	            10 /* cs */, 0, &key, &qualifier);
+	if (err == NULL)
+	{
+		switch (qualifier)
+		{
+			case 255:
+				/* Timeout with no key */
+				result = CONFIRM_PENDING;
+				break;
+
+			case 27:
+				/* Escape is 'reject' */
+				_swix(OS_Byte, _IN(0), OsByte_AcknowledgeEscape);
+			default:
+				break;
+
+			case 0:
+				/* Only accept accept for accept */
+				key = (ucase == NULL) ? (key & 0xDF)
+				                      : ucase[key];
+				if (key == perm) result = CONFIRM_ACCEPT_SAVE;
+				if (key == accept) result = CONFIRM_ACCEPT;
+				break;
+		}
+	}
+
+	return result;
+}
+
+int upcall_handler(_kernel_swi_regs *r, void *pw)
+{
+	int desktop;
+
+	switch (r->r[0])
+	{
+		case UpCall_ModifyingFile:
+			/* => r0 = UpCall_ModifyingFile
+			 *    r9 = subreason (anything)
+			 *    r2 = anything
+			 *    r3 = anything
+			 */
+			randwords[randword] = r->r[2] ^ r->r[3];
+			randword = (randword + 1) % (UPCALL_RAND_MIN / sizeof(int));
+			break;
+
+		case UpCall_CertificateConfirm:
+			/* => r0 = UpCall_CertificateConfirm
+			 *    r1 = pointer to certificate chain
+			 *    r2 = iteration count
+			 * <= r0 = 0 = thinking, go away and ask later
+			 *         1 = accept the certificate chain
+			 *        -1 = reject the certificate chain
+			 */
+			_swix(Wimp_ReadSysInfo, _IN(0) | _OUT(0), 3, &desktop);
+			if (desktop)
+			{
+				r->r[0] = upcall_desktop_confirm((const certchain_t *)r->r[1], (size_t)r->r[2]);
+			}
+			else
+			{
+				r->r[0] = upcall_cli_confirm((const certchain_t *)r->r[1], (size_t)r->r[2]);
+			}
+			return 0; /* Claim */
+
+		case UpCall_CertificateConfirmEnd:
+			/* => r0 = UpCall_CertificateConfirmEnd
+			 *    r1 = pointer to certificate chain
+			 *    r2 = outcome (accept = 1, reject = -1)
+			 */
+			_swix(Wimp_ReadSysInfo, _IN(0) | _OUT(0), 3, &desktop);
+			if (desktop)
+			{
+				confirmqueue_t *q;
+
+				SLIST_FOREACH(q, &taskqueue, list)
+				{
+					if (q->chain == (const certchain_t *)r->r[1])
+					{
+						/* Still in the queue, wake the Wimp task */
+						q->reply = (confirm_t)r->r[2];
+						taskpoll |= TASKPOLL_CLOSE;
+					}
+				}
+			}
+			else
+			{
+				if ((r->r[2] == CONFIRM_ACCEPT) ||
+				    (r->r[2] == CONFIRM_ACCEPT_SAVE))
+				{
+					printf("%s\n", intl_lookup("Acc"));
+				}
+				else
+				{
+					printf("%s\n", intl_lookup("Rej"));
+				}
+			}
+			return 0; /* Claim */
+	}
+	UNUSED(pw);
+
+	return 1; /* Pass on */
+}
+
+int upcall_read_rand(void *arg, unsigned char *buffer, size_t request, size_t *actual)
+{
+	if (_swix(CryptRandom_Block, _INR(0,1), buffer, request) != NULL)
+	{
+		/* No CryptRandom, use our own set */
+		request = MIN(request, UPCALL_RAND_MIN);
+		memcpy(buffer, randwords, request);
+	}
+	*actual = request;
+	UNUSED(arg);
+
+	return 0;
+}

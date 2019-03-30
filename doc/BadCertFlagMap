@@ -1,0 +1,26 @@
+Define                               Display field               Icon
+======                               =============               ====
+MBEDTLS_X509_BADCERT_CN_MISMATCH   - Issued to = domain          DontCare
+MBEDTLS_X509_BADCERT_NOT_TRUSTED   - Issued by = CA              No
+MBEDTLS_X509_BADCERT_MISSING       - All fields = "Missing"      No
+MBEDTLS_X509_BADCERT_SKIP_VERIFY   - All fields = "Skipped"      No
+MBEDTLS_X509_BADCERT_OTHER         - All fields = "Unknown"      No
+MBEDTLS_X509_BADCERT_BAD_MD        - Signature = "Unacceptable"  No
+MBEDTLS_X509_BADCERT_BAD_PK        - Signature = "Unacceptable"  No
+MBEDTLS_X509_BADCERT_BAD_KEY       - Signature = "Unacceptable"  No
+MBEDTLS_X509_BADCERT_EXPIRED       - Validity = dates            No
+MBEDTLS_X509_BADCERT_FUTURE        - Validity = dates            No
+MBEDTLS_X509_BADCERT_REVOKED       - Validity = "Revoked"        No
+MBEDTLS_X509_BADCRL_FUTURE         - Validity = "Bad revocation" No
+MBEDTLS_X509_BADCERT_KEY_USAGE     - Validity = "Bad usage"      No
+MBEDTLS_X509_BADCERT_EXT_KEY_USAGE - Validity = "Bad usage"      No
+MBEDTLS_X509_BADCERT_NS_CERT_TYPE  - Validity = "Bad usage"      No
+MBEDTLS_X509_BADCRL_NOT_TRUSTED    - Validity = "Bad revocation" DontCare
+MBEDTLS_X509_BADCRL_EXPIRED        - Validity = "Bad revocation" DontCare
+MBEDTLS_X509_BADCRL_BAD_MD         - Validity = "Bad revocation" DontCare
+MBEDTLS_X509_BADCRL_BAD_PK         - Validity = "Bad revocation" DontCare
+MBEDTLS_X509_BADCRL_BAD_KEY        - Validity = "Bad revocation" DontCare
+
+Any 'Reject' button press rejects & closes all in the chain.
+'Accept' closes the current link in the chain, and accepts the chain if the last one.
+'View' dumps the data via PipeFS to !Edit or similar.

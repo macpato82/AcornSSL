@@ -1,0 +1,88 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/Networking/Fetchers/AcornSSL/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2018, RISC OS Open Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#include <time.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "mbedtls/x509.h"
+
+#include "timelib.h"
+#include "DebugLib/DebugLib.h"
+
+static bool is_leap(uint32_t year)
+{
+	/* Good for 1900-2248, which covers RISC OS 5 byte time */
+	if ((year == 1900) || (year == 2100) || (year == 2200))
+	{
+		return false;
+	}
+	return (year % 4) == 0;
+}
+
+static int leap_days_between(uint32_t y1, uint32_t y2)
+{
+	int days;
+
+	y1--; y2--;
+
+	days =        ((y2 / 4)   - (y1 / 4));   /* Roll a day for each leap year */
+	days = days - ((y2 / 100) - (y1 / 100)); /* But not leap centuries */
+	days = days + ((y2 / 400) - (y1 / 400)); /* Unless a multiple of 400 */
+
+	return days;
+}
+
+time_t x509_to_utc(const mbedtls_x509_time *in)
+{
+	static const uint16_t complete_months[] = { -1, 0, /* 1's based months */
+	                                            0,   31,  59,  90,  120, 151,
+	                                            181, 212, 243, 273, 304, 334
+	                                          };
+	time_t   days, secs;
+	uint64_t sum;
+
+	/* No hope pre-epoch */
+	if (in->year < 1970) return (time_t)-1;
+	dprintf(("", "convert %d-%d-%d %02d:%02d:%02d", in->year, in->mon, in->day,
+	                                                in->hour, in->min, in->sec));
+
+	days  = 365 * (in->year - 1970);
+	days += leap_days_between(1970, in->year);
+	days += complete_months[in->mon];
+	if ((in->mon > 2) && is_leap(in->year))
+	{
+		days++;
+	}
+	days += in->day - 1;
+
+	secs  = 3600 * in->hour;
+	secs += 60 * in->min;
+	secs += in->sec;
+
+	/* Combine and worry about overflow */
+	sum = (86400uLL * days) + secs;
+	if ((time_t)sum != sum) return (time_t)-1;
+	return (time_t)sum;
+}
