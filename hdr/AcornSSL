@@ -55,6 +55,7 @@ SWIClass        SETS    AcornSSLSWI_Name
 ; Create session flags
                         ^ 0
 CreateSession_New       # 1
+CreateSession_ReuseAuth # 1
 CreateSession_CmdMask   * &FF
 CreateSession_CmdShift  * 0
 CreateSession_FlagMask  * &FFFFFF

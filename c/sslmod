@@ -535,7 +535,7 @@ _kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
 			                /* Out */ &r->r[0]);
 
 		case AcornSSL_CreateSession - AcornSSL_00:
-			return api_createsession(/* In  */ r->r[0], (uint32_t)r->r[1],
+			return api_createsession(/* In  */ r->r[0], (uint32_t)r->r[1], r->r[2],
 			                         /* Out */ &r->r[0]);
 
 		case AcornSSL_Getpeername - AcornSSL_00:

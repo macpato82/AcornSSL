@@ -156,8 +156,14 @@ Initialises a secure session with an existing socket.
 
 On entry
    R0 = socket handle from Socket_Creat
-   R1 = bits 0-7  : reason code 0, create
+   R1 = bits 0-7  : reason code
         bits 8-31 : reserved for future use (zero)
+   Others dependent on reason code.
+
+reason code = CreateSession_New                                0
+On entry
+   R0 = socket handle from Socket_Creat
+   R1 = CreateSession_New
 
 On exit
    R0 = ssl handle
@@ -165,6 +171,21 @@ On exit
 Use
    This SWI performs a similar function to AcornSSL_Creat, but allows the
    caller to handover a previously opened socket.
+
+reason code = CreateSession_ReuseAuth                          1
+On entry
+   R0 = socket handle from Socket_Creat
+   R1 = CreateSession_ReuseAuth
+   R2 = ssl handle of another secure session already authenticated with
+        the server.
+
+On exit
+   R0 = ssl handle
+
+Use
+   This SWI performs a similar function to AcornSSL_Creat, but allows the
+   caller to handover a previously opened socket.
+   Uses the authentication of another authenticated secure session to connect.
 
 AcornSSL_Getpeername                                           SWI &50F89
 

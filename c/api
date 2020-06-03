@@ -44,6 +44,7 @@
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#include "mbedtls/ssl.h"
 
 #include "sslmod.h"
 #include "api.h"
@@ -739,13 +740,14 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
  * \param  result Pointer to return result (an opaque SSL handle)
  * \return Pointer to error block
  */
-_kernel_oserror *api_createsession(int s, uint32_t flags,
+_kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
                                    int *result)
 {
 	sslhandle_t     *h;
 	_kernel_oserror *err;
+	int cmd = (flags >> CreateSession_CmdShift) & CreateSession_CmdMask;
 
-	if ((((flags >> CreateSession_CmdShift) & CreateSession_CmdMask) != CreateSession_New) ||
+	if (((cmd != CreateSession_New) && (cmd != CreateSession_ReuseAuth)) ||
 	    (((flags >> CreateSession_FlagShift) & CreateSession_FlagMask) != 0))
 	{
 		dprintf(("api", "bad flags %08x to CreateSession\n", flags));
@@ -758,6 +760,36 @@ _kernel_oserror *api_createsession(int s, uint32_t flags,
 	err = new_sslhandle(&h);
 	if (err != NULL) return err;
 	err = common_conf_sslhandle(h, true);
+
+	if ((err == NULL) && (cmd == CreateSession_ReuseAuth))
+	{
+		int          mbederr;
+		sslhandle_t *src_h;
+
+		err = find_sslhandle(arg, &src_h);
+		if (err == NULL)
+		{
+			mbedtls_ssl_session sess;
+
+			/* Implicitly already accepted */
+			h->confirm = CONFIRM_ACCEPT;
+
+			/* Copy session from source secure socket */
+			mbedtls_ssl_session_init(&sess);
+			mbederr = mbedtls_ssl_get_session(&src_h->ssl, &sess);
+			if (mbederr == 0)
+			{
+				mbederr = mbedtls_ssl_set_session(&h->ssl, &sess);
+			        mbedtls_ssl_session_free(&sess);
+			}
+			if (mbederr != 0)
+			{
+				dprintf(("api", "ssl_setup returned %d\n", mbederr));
+				err = intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
+			}
+		}
+	}
+
 	if (err == NULL)
 	{
 		dprintf(("api", "existing socket %d associated with SSL handle %p\n", s, (void *)h));
