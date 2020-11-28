@@ -28,7 +28,7 @@
 #include <string.h>
 #include "swis.h"
 
-#include "Global/Upcall.h"
+#include "Global/UpCall.h"
 #include "Interface/AcornSSL.h"
 #include "AsmUtils/callbacks.h"
 
