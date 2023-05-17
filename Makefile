@@ -28,14 +28,13 @@
 COMPONENT    = AcornSSL
 OBJS         = sslmod api upcalling confirmtask confirmenter timelib
 CMHGDEPENDS  = sslmod api upcalling
-CMHGFLAGS    = -IC:mbedTLS
 ROMCDEFINES  = -DROM
 RESFSDIR     = ${RESDIR}${SEP}URL${SEP}${TARGET}
 HDRS         =
 ASMCHDRS     = AcornSSL
 ASMHDRS      = AcornSSL
 CMHGAUTOHDR  = AcornSSL
-CINCLUDES    = -IC:mbedTLS,TCPIPLibs:,C:
+CINCLUDES    = ${MBEDTLSINC} ${TCPIPINC}
 LIBS        += ${MBEDTLSLIB} ${ASMUTILS} ${TBOXLIB} ${WIMPLIB} ${NET5LIBS}
 CDEFINES     = -DMBEDTLS_CONFIG_FILE="\"ro_config.h\""
 CDFLAGS      = -DDEBUGLIB
@@ -43,6 +42,6 @@ INSTRES_FILES = Res StartDAS
 
 include CModule
 
-CFLAGS      += -Wp
+CFLAGS      += ${C_NOWARN_NON_ANSI_INCLUDES}
 
 # Dynamic dependencies:

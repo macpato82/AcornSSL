@@ -23,7 +23,7 @@
  * Use is subject to license terms.
  */
 #include "Global/Services.h"
-#include "mbedtls/ro_config.h"
+#include "mbedTLS/ro_config.h"
 #include "VersionNum"
 
 title-string:           Module_ComponentName
