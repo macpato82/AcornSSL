@@ -299,7 +299,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 	if (!h->connected)
 	{
 		struct sockaddr_in peer;
-		int peersize = sizeof(peer);
+		socklen_t peersize = sizeof(peer);
 
 		if (getpeername(h->net.fd, (struct sockaddr *)&peer, &peersize) == -1)
 		{
@@ -808,7 +808,7 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
  * \param  result Pointer to return result as for Socket_Connect
  * \return Pointer to error block
  */
-_kernel_oserror *api_connect(int ext, const struct sockaddr *name, int namelen,
+_kernel_oserror *api_connect(int ext, const struct sockaddr *name, socklen_t namelen,
                              int *result)
 {
 	sslhandle_t     *h;
@@ -1096,7 +1096,7 @@ _kernel_oserror *api_ioctl(int ext, unsigned long cmd, void *arg,
  * \param  result Pointer to return result as for Socket_Getpeername
  * \return Pointer to error block
  */
-_kernel_oserror *api_getpeername(int ext, struct sockaddr *name, int *namelen,
+_kernel_oserror *api_getpeername(int ext, struct sockaddr *name, socklen_t *namelen,
                                  int *result)
 {
 	sslhandle_t     *h;
@@ -1128,7 +1128,7 @@ _kernel_oserror *api_getpeername(int ext, struct sockaddr *name, int *namelen,
  * \param  result Pointer to return result as for Socket_Getsockname
  * \return Pointer to error block
  */
-_kernel_oserror *api_getsockname(int ext, struct sockaddr *name, int *namelen,
+_kernel_oserror *api_getsockname(int ext, struct sockaddr *name, socklen_t *namelen,
                                  int *result)
 {
 	sslhandle_t     *h;
@@ -1162,7 +1162,7 @@ _kernel_oserror *api_getsockname(int ext, struct sockaddr *name, int *namelen,
  * \param  result Pointer to return result as for Socket_Getsockopt
  * \return Pointer to error block
  */
-_kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, int *optlen,
+_kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, socklen_t *optlen,
                                 int *result)
 {
 	sslhandle_t     *h;
@@ -1225,7 +1225,7 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, i
  * \param  result Pointer to return result as for Socket_Setsockopt
  * \return Pointer to error block
  */
-_kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *optval, int optlen,
+_kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *optval, socklen_t optlen,
                                 int *result)
 {
 	sslhandle_t     *h;

@@ -511,7 +511,7 @@ _kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
 			                 /* Out */ &r->r[0]);
 
 		case AcornSSL_Connect - AcornSSL_00:
-			return api_connect(/* In  */ r->r[0], (const struct sockaddr *)r->r[1], r->r[2],
+			return api_connect(/* In  */ r->r[0], (const struct sockaddr *)r->r[1], (socklen_t)r->r[2],
 			                   /* Out */ &r->r[0]);
 
 		case AcornSSL_Shutdown - AcornSSL_00:
@@ -523,7 +523,7 @@ _kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
 			                 /* Out */ &r->r[0]);
 
 		case AcornSSL_Getsockopt - AcornSSL_00:
-			return api_getsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (void *)r->r[3], (int *)r->r[4],
+			return api_getsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (void *)r->r[3], (socklen_t *)r->r[4],
 			                      /* Out */ &r->r[0]);
 
 		case AcornSSL_Write - AcornSSL_00:
@@ -539,15 +539,15 @@ _kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
 			                         /* Out */ &r->r[0]);
 
 		case AcornSSL_Getpeername - AcornSSL_00:
-			return api_getpeername(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (int *)r->r[2],
+			return api_getpeername(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (socklen_t *)r->r[2],
 			                       /* Out */ &r->r[0]);
 
 		case AcornSSL_Getsockname - AcornSSL_00:
-			return api_getsockname(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (int *)r->r[2],
+			return api_getsockname(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (socklen_t *)r->r[2],
 			                       /* Out */ &r->r[0]);
 
 		case AcornSSL_Setsockopt - AcornSSL_00:
-			return api_setsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (const void *)r->r[3], r->r[4],
+			return api_setsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (const void *)r->r[3], (socklen_t)r->r[4],
 			                      /* Out */ &r->r[0]);
 
 		case AcornSSL_Stat - AcornSSL_00:
