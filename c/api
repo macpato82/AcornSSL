@@ -44,6 +44,7 @@
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#include "mbedtls/oid.h"
 #include "mbedtls/ssl.h"
 
 #include "sslmod.h"
@@ -192,6 +193,7 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 			certchain_t *anchor, *chain, *last;
 			char  temp[MBEDTLS_X509_MAX_DN_NAME_SIZE];
 			char *heap;
+			const char *alg;
 
 			/* At least one test failed for at least one certificate */
 			if (h->confirmmax == 0)
@@ -214,6 +216,10 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 			space = h->certs * common;
 			for (i = 0; i < h->certs; i++)
 			{
+				if (mbedtls_oid_get_sig_alg_desc(&h->cert[i].crt->sig_oid, &alg) != 0)
+				{
+					alg = "???";
+				}
 				space = space +
 				        sizeof(uint32_t) /* Version */ +
 				        sizeof(time_t) /* ValidFrom */ +
@@ -221,9 +227,7 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 				        mbedtls_x509_dn_gets(temp, sizeof(temp), &h->cert[i].crt->subject) +
 				        mbedtls_x509_dn_gets(temp, sizeof(temp), &h->cert[i].crt->issuer) +
 				        mbedtls_x509_serial_gets(temp, sizeof(temp), &h->cert[i].crt->serial) +
-				        mbedtls_x509_sig_alg_gets(temp, sizeof(temp), &h->cert[i].crt->sig_oid,
-				                                  h->cert[i].crt->sig_pk, h->cert[i].crt->sig_md,
-				                                  &h->cert[i].crt->sig_opts) +
+				        strlen(alg) +
 				        4 + 4 + 4 + 4 /* Terminate and align strings */;
 			}
 			anchor = malloc(space);
@@ -257,9 +261,11 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 				len = mbedtls_x509_serial_gets(heap, sizeof(temp), &h->cert[i].crt->serial);
 				ADDTAG(tag, heap, len + 1, CertTag_Serial, CertTagType_String);
 
-				len = mbedtls_x509_sig_alg_gets(heap, sizeof(temp), &h->cert[i].crt->sig_oid,
-				                                h->cert[i].crt->sig_pk, h->cert[i].crt->sig_md,
-				                                &h->cert[i].crt->sig_opts);
+				if (mbedtls_oid_get_sig_alg_desc(&h->cert[i].crt->sig_oid, &alg) != 0)
+				{
+					alg = "???";
+				}
+				len = strlen(strcpy(heap, alg));
 				ADDTAG(tag, heap, len + 1, CertTag_Signature, CertTagType_String);
 
 				*(time_t *)heap = x509_to_utc(&h->cert[i].crt->valid_from);
@@ -290,7 +296,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 	int      mbederr;
 	uint32_t flags, now;
 
-	if (h->ssl.state == MBEDTLS_SSL_HANDSHAKE_OVER)
+	if (mbedtls_ssl_is_handshake_over(&h->ssl))
 	{
 		/* Already done */
 		return NULL;
@@ -350,7 +356,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 		/* Success if zero, otherwise an error of some sort */
 		if (mbederr == 0)
 		{
-			if (h->ssl.state == MBEDTLS_SSL_HANDSHAKE_OVER)
+			if (mbedtls_ssl_is_handshake_over(&h->ssl))
 			{
 				dprintf(("api", "handshake completed, is %s using %s\n",
 				                mbedtls_ssl_get_version(&h->ssl),
@@ -1174,7 +1180,7 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, s
 		if ((optname == SO_ACORNSSL_HOSTNAME) && (level == SOL_SOCKET))
 		{
 			/* Session host name */
-			if (*optlen != sizeof(char *))
+			if (*optlen != sizeof(const char *))
 			{
 				*result = -1;
 				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
@@ -1182,7 +1188,7 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, s
 			else
 			{
 				*result = ESUCCESS;
-				*(char **)optval = h->ssl.hostname;
+				*(const char **)optval = mbedtls_ssl_get_hostname(&h->ssl);
 			}
 			return err;
 		}

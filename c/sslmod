@@ -130,7 +130,7 @@ bool check_der_exception(const void *der, size_t dersize)
 	}
 
 	/* Stringify the der to make comparison easier */
-	mbedtls_md5_ret((const unsigned char *)der, dersize, hash);
+	mbedtls_md5((const unsigned char *)der, dersize, hash);
 	*match = '\0';
 	for (i = 0; i < sizeof(hash); i++)
 	{
@@ -170,7 +170,7 @@ _kernel_oserror *add_der_exception(const void *der, size_t dersize)
 		size_t size;
 		bool   new = exception_store == NULL;
 
-		mbedtls_md5_ret((const unsigned char *)der, dersize, hash);
+		mbedtls_md5((const unsigned char *)der, dersize, hash);
 		size = exception_size + (2 * sizeof(hash)) + 1;
 		if (new) size++; /* For a null terminator */
 		dprintf(("", "Adding CertExcept exception, now %u bytes of store\n", size));
