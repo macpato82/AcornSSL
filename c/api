@@ -87,6 +87,9 @@ typedef struct sslhandle_t
 	certpair_t  cert[MBEDTLS_X509_MAX_INTERMEDIATE_CA];
 	SLIST_ENTRY(sslhandle_t) list;
 
+	bool        session_valid;
+	mbedtls_ssl_session session;
+
 	uint32_t    guard;        /* Check word */
 #define API_GUARD        0x6465624D
 #define API_GUARD_UNINIT -1
@@ -623,6 +626,13 @@ static _kernel_oserror *free_sslhandle(sslhandle_t *h)
 		h->guard = API_GUARD_UNINIT;
 	}
 
+	/* Free session, if held */
+	if (h->session_valid)
+	{
+		mbedtls_ssl_session_free(&h->session);
+		h->session_valid = false;
+	}
+
 	/* Finalise each library sub component */
 	dprintf(("api", "finishing with session at %p\n", (void *)h));
 	mbedtls_net_init(&h->net);
@@ -656,6 +666,9 @@ static _kernel_oserror *new_sslhandle(sslhandle_t **h)
 		new->peekbuffer = NULL;
 		new->peekspace = 0;
 		new->peekfrom = new->peekto = 0;
+
+		/* No session held */
+		new->session_valid = false;
 
 		/* Initialise each library sub component */
 		dprintf(("api", "initialise session at %p\n", (void *)new));
@@ -739,6 +752,10 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 		h->clientsocket = false;
 		*result = (int)h;
 	}
+	else
+	{
+		free_sslhandle(h);
+	}
 
 	return err;
 }
@@ -778,22 +795,24 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
 		err = find_sslhandle(arg, &src_h);
 		if (err == NULL)
 		{
-			mbedtls_ssl_session sess;
-
 			/* Implicitly already accepted */
 			h->confirm = CONFIRM_ACCEPT;
 
-			/* Copy session from source secure socket */
-			mbedtls_ssl_session_init(&sess);
-			mbederr = mbedtls_ssl_get_session(&src_h->ssl, &sess);
-			if (mbederr == 0)
+			/* Copy session from source secure socket to the new handle (once only) */
+			if (!src_h->session_valid)
 			{
-				mbederr = mbedtls_ssl_set_session(&h->ssl, &sess);
-				mbedtls_ssl_session_free(&sess);
+				mbedtls_ssl_session_init(&src_h->session);
+				mbederr = mbedtls_ssl_get_session(&src_h->ssl, &src_h->session);
+				src_h->session_valid = (mbederr == 0);
 			}
+			if (src_h->session_valid)
+			{
+				mbederr = mbedtls_ssl_set_session(&h->ssl, &src_h->session);
+			}
+
 			if (mbederr != 0)
 			{
-				dprintf(("api", "ssl_setup returned %d\n", mbederr));
+				dprintf(("api", "mbedtls_ssl_get/set_session returned %d\n", mbederr));
 				err = intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
 			}
 		}
@@ -805,6 +824,10 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
 		h->net.fd = s;
 		h->clientsocket = true;
 		*result = (int)h;
+	}
+	else
+	{
+		free_sslhandle(h);
 	}
 
 	return err;
