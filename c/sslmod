@@ -99,18 +99,24 @@ const char *intl_integer(int32_t value)
 	return (const char *)string;
 }
 
-_kernel_oserror *intl_error(sslmod_err_t which, const char *extra)
+_kernel_oserror *intl_errorbuff(sslmod_err_t which, const char *extra, _kernel_oserror *buff)
 {
 	_kernel_oserror *err;
 	internaterr_t    msg_errblk;
 
-	/* Translate via MessageTrans' internal buffer */
+	/* Find the token and substitute any extra argument given */
 	sprintf(msg_errblk.errmess, "E%02x", which);
 	msg_errblk.errnum = which + ErrorBase_HTTPS;
 	err = _swix(MessageTrans_ErrorLookup, _INR(0,7),
-	            &msg_errblk, msgs_struct, 0, 0, extra, 0, 0, 0);
+	            &msg_errblk, msgs_struct, buff, sizeof(*buff), extra, 0, 0, 0);
 
 	return err;
+}
+
+_kernel_oserror *intl_error(sslmod_err_t which, const char *extra)
+{
+	/* Pass no buffer to use MessageTrans' internal buffer */
+	return intl_errorbuff(which, extra, NULL);
 }
 
 /*

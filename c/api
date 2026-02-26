@@ -76,6 +76,8 @@ typedef struct sslhandle_t
 	size_t      peekfrom;
 	size_t      peekto;
 
+	_kernel_oserror errbuff;  /* Safe copy of the last error on this handle */
+
 	confirm_t   confirm;      /* An unverified certificate awaits user */
 	uint32_t    confirmtime;  /* Time at which awaiting started */
 	uint32_t    confirmmax;   /* Maximum time to await */
@@ -365,7 +367,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 			}
 
 			/* Not there yet, fake a not connected error */
-			err = intl_error(ERR07_HANDSHAKE_ERROR, "-1");
+			err = intl_errorbuff(ERR07_HANDSHAKE_ERROR, "-1", &h->errbuff);
 			REALLYSETDCI4ERRNO(err->errnum, ENOTCONN);
 			return err;
 		}
@@ -375,7 +377,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 			    (mbederr != MBEDTLS_ERR_SSL_WANT_WRITE))
 			{
 				dprintf(("api", "ssl_handshake_step returned %d\n", mbederr));
-				err = intl_error(ERR07_HANDSHAKE_ERROR, intl_integer(-mbederr));
+				err = intl_errorbuff(ERR07_HANDSHAKE_ERROR, intl_integer(-mbederr), &h->errbuff);
 				if (mbederr == MBEDTLS_ERR_NET_CONN_RESET)
 				{
 					/* Fatal, map this to equivalent Unix error */
@@ -415,7 +417,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 
 			dprintf(("api", "ssl_get_verify_result returned 0x%X\n", flags));
 			sprintf(hex, "0x%08X", flags);
-			return intl_error(ERR07_HANDSHAKE_ERROR, hex);
+			return intl_errorbuff(ERR07_HANDSHAKE_ERROR, hex, &h->errbuff);
 		}
 		dprintf(("api", "verify OK too\n"));
 	}
@@ -470,7 +472,7 @@ static _kernel_oserror *write_to_sslhandle(sslhandle_t *h, const char *buff, siz
 			{
 				dprintf(("api", "ssl_write returned %d\n", mbederr));
 				*result = -1;
-				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
 				break;
 			}
 
@@ -479,7 +481,7 @@ static _kernel_oserror *write_to_sslhandle(sslhandle_t *h, const char *buff, siz
 			{
 				dprintf(("api", "ssl_write would block\n"));
 				*result = -1;
-				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
 				REALLYSETDCI4ERRNO(err->errnum, EWOULDBLOCK);
 				break;
 			}
@@ -534,7 +536,7 @@ static _kernel_oserror *read_from_sslhandle(sslhandle_t *h, char *buff, size_t l
 			{
 				dprintf(("api", "ssl_read returned %d\n", mbederr));
 				*result = -1;
-				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
 				break;
 			}
 
@@ -543,7 +545,7 @@ static _kernel_oserror *read_from_sslhandle(sslhandle_t *h, char *buff, size_t l
 			{
 				dprintf(("api", "ssl_read would block\n"));
 				*result = -1;
-				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
+				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
 				REALLYSETDCI4ERRNO(err->errnum, EWOULDBLOCK);
 				break;
 			}
@@ -583,7 +585,7 @@ static _kernel_oserror *common_conf_sslhandle(sslhandle_t *h, bool client)
 	if (mbederr != 0)
 	{
 		dprintf(("api", "ssl_config_defaults returned %d\n", mbederr));
-		return intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
+		return intl_errorbuff(ERR02_SSL_NO_INIT, intl_integer(-mbederr), &h->errbuff);
 	}
 
 	/* Certificate checking config */
@@ -603,7 +605,7 @@ static _kernel_oserror *common_conf_sslhandle(sslhandle_t *h, bool client)
 	if (mbederr != 0)
 	{
 		dprintf(("api", "ssl_setup returned %d\n", mbederr));
-		return intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
+		return intl_errorbuff(ERR02_SSL_NO_INIT, intl_integer(-mbederr), &h->errbuff);
 	}
 
 	/* Hook up basic IO for the library to do handshake with */
@@ -709,6 +711,16 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 	sslhandle_t     *h;
 	_kernel_oserror *err;
 
+	if ((domain >> CreateSession_FlagShift) & CreateSession_FlagMask)
+	{
+		/* All flags currently reserved for future use */
+		dprintf(("api", "bad flags %08x to Creat\n", domain));
+		err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+		REALLYSETDCI4ERRNO(err->errnum, EINVAL);
+
+		return err;
+	}
+
 	err = new_sslhandle(&h);
 	if (err != NULL) return err;
 	err = common_conf_sslhandle(h, true);
@@ -716,15 +728,6 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 	{
 		int s;
 
-		if ((domain >> CreateSession_FlagShift) & CreateSession_FlagMask)
-		{
-			/* All flags currently reserved for future use */
-			dprintf(("api", "bad flags %08x to Creat\n", domain));
-			err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
-			REALLYSETDCI4ERRNO(err->errnum, EINVAL);
-
-			return err;
-		}
 		s = socket(domain, type, protocol);
 		if (s == -1)
 		{
@@ -786,7 +789,7 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
 			if (mbederr == 0)
 			{
 				mbederr = mbedtls_ssl_set_session(&h->ssl, &sess);
-			        mbedtls_ssl_session_free(&sess);
+				mbedtls_ssl_session_free(&sess);
 			}
 			if (mbederr != 0)
 			{
@@ -973,7 +976,7 @@ _kernel_oserror *api_recv(int ext, char *buff, size_t len, int flags,
 			newbuffer = realloc(h->peekbuffer, len);
 			if (newbuffer == NULL)
 			{
-				return intl_error(ERR05_MALLOC, NULL);
+				return intl_errorbuff(ERR05_MALLOC, NULL, &h->errbuff);
 			}
 			else
 			{
@@ -1183,7 +1186,7 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, s
 			if (*optlen != sizeof(const char *))
 			{
 				*result = -1;
-				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
 			}
 			else
 			{
@@ -1198,7 +1201,7 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, s
 			if (*optlen != sizeof(uint32_t))
 			{
 				*result = -1;
-				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
 			}
 			else
 			{
@@ -1248,7 +1251,7 @@ _kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *opt
 			if (optlen != sizeof(const char *))
 			{
 				*result = -1;
-				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
 			}
 			else
 			{
@@ -1259,11 +1262,11 @@ _kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *opt
 					*result = -1;
 					if (mbederr == MBEDTLS_ERR_SSL_ALLOC_FAILED)
 					{
-						return intl_error(ERR05_MALLOC, NULL);
+						return intl_errorbuff(ERR05_MALLOC, NULL, &h->errbuff);
 					}
 
 					/* Treat everything else as invalid parameter */
-					err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+					err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
 					REALLYSETDCI4ERRNO(err->errnum, EINVAL);
 				}
 			}
@@ -1275,7 +1278,7 @@ _kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *opt
 			if (optlen != sizeof(uint32_t))
 			{
 				*result = -1;
-				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
 			}
 			else
 			{
