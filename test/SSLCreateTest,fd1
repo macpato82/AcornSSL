@@ -1,0 +1,31 @@
+REM >SSLCreateTest
+REM AcornSSL session-creation diagnostic
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+PRINT "AcornSSL session creation diagnostic"
+SYS "XAcornSSL_Version" TO version%;flags%
+IF flags% AND 1 THEN
+  PRINT "AcornSSL_Version failed: ";$(version%+4)
+  END
+ENDIF
+PRINT "Module version: ";version% / 100
+
+SYS "XAcornSSL_Creat",2,1,0 TO handle%;flags%
+IF flags% AND 1 THEN
+  PRINT "AcornSSL_Creat failed"
+  PRINT "  error: &";~(!handle%)
+  PRINT "  text : ";
+  SYS "OS_Write0",handle%+4
+  PRINT
+  END
+ENDIF
+
+PRINT "AcornSSL_Creat succeeded, handle &";~handle%
+SYS "XAcornSSL_Close",handle% TO result%;flags%
+IF flags% AND 1 THEN
+  PRINT "AcornSSL_Close failed: ";
+  SYS "OS_Write0",result%+4
+  PRINT
+ELSE
+  PRINT "AcornSSL_Close succeeded"
+ENDIF

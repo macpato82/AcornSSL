@@ -30,6 +30,7 @@
 #include "swis.h"
 
 #include "Global/NewErrors.h"
+#include "AcornSSLHdr.h"
 #include "Global/Services.h"
 #include "Global/RISCOS.h"
 #include "Global/OSMem.h"
@@ -52,8 +53,11 @@
 #include "api.h"
 #include "confirm.h"
 #include "upcalling.h"
-#include "AcornSSLHdr.h"
 #include "DebugLib/DebugLib.h"
+
+#ifndef OS_ConvertVariform
+#define OS_ConvertVariform 0x000000ED
+#endif
 
 /* Global state */
 mbedtls_x509_crt        cacert_root;

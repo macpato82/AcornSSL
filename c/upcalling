@@ -32,6 +32,7 @@
 
 #include "Global/OsBytes.h"
 #include "Global/UpCall.h"
+#include "AcornSSLHdr.h"
 #include "Interface/AcornSSL.h"
 
 #include "sys/queue.h"
@@ -42,7 +43,6 @@
 #include "sslmod.h"
 #include "confirm.h"
 #include "upcalling.h"
-#include "AcornSSLHdr.h"
 #include "DebugLib/DebugLib.h"
 
 /* Local state */

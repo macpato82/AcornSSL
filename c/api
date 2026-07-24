@@ -30,6 +30,7 @@
 #include "swis.h"
 
 #include "Global/UpCall.h"
+#include "AcornSSLHdr.h"
 #include "Interface/AcornSSL.h"
 #include "AsmUtils/callbacks.h"
 
@@ -52,8 +53,10 @@
 #include "api.h"
 #include "confirm.h"
 #include "timelib.h"
-#include "AcornSSLHdr.h"
 #include "DebugLib/DebugLib.h"
+
+/* PSA is initialised lazily when the first SSL session is allocated. */
+extern int psa_crypto_init(void);
 
 /*
  * Mbed TLS uses fcntl() to switch sockets between blocking and non-blocking
@@ -335,21 +338,11 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 	_kernel_oserror *err;
 	int      mbederr;
 	uint32_t flags, now;
-	const char *hostname;
 
 	if (mbedtls_ssl_is_handshake_over(&h->ssl))
 	{
 		/* Already done */
 		return NULL;
-	}
-
-	/* SNI and certificate hostname verification are inseparable. */
-	hostname = mbedtls_ssl_get_hostname(&h->ssl);
-	if ((hostname == NULL) || (*hostname == '\0'))
-	{
-		err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
-		REALLYSETDCI4ERRNO(err->errnum, EINVAL);
-		return err;
 	}
 
 	if (!h->connected)
@@ -692,6 +685,7 @@ static _kernel_oserror *new_sslhandle(sslhandle_t **h)
 	if (new != NULL)
 	{
 		int mbederr;
+		int psa_status;
 		_kernel_oserror *err;
 
 		/* Initially invalid */
@@ -711,6 +705,18 @@ static _kernel_oserror *new_sslhandle(sslhandle_t **h)
 		mbedtls_ssl_init(&new->ssl);
 		mbedtls_ssl_config_init(&new->conf);
 		mbedtls_ctr_drbg_init(&new->ctr_drbg);
+
+		/* Do not initialise PSA from the module entry point: on some RISC OS
+		 * builds that runs before the dynamic-area/task environment is ready.
+		 * Initialise it on first session creation instead. */
+		psa_status = psa_crypto_init();
+		if (psa_status != 0)
+		{
+			dprintf(("api", "psa_crypto_init returned %d\n", psa_status));
+			free_sslhandle(new);
+			return intl_error(ERR02_SSL_NO_INIT, intl_integer(-psa_status));
+		}
+
 		mbederr = mbedtls_ctr_drbg_seed(&new->ctr_drbg,
 		                                mbedtls_entropy_func, &entropy_pool,
 		                                (const unsigned char *)Module_Title, sizeof(Module_Title) - 1);
@@ -759,6 +765,16 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 	sslhandle_t     *h;
 	_kernel_oserror *err;
 
+	if ((domain >> CreateSession_FlagShift) & CreateSession_FlagMask)
+	{
+		/* All flags currently reserved for future use */
+		dprintf(("api", "bad flags %08x to Creat\n", domain));
+		err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+		REALLYSETDCI4ERRNO(err->errnum, EINVAL);
+
+		return err;
+	}
+
 	err = new_sslhandle(&h);
 	if (err != NULL) return err;
 	err = common_conf_sslhandle(h, true);
@@ -766,15 +782,6 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 	{
 		int s;
 
-		if ((domain >> CreateSession_FlagShift) & CreateSession_FlagMask)
-		{
-			/* All flags currently reserved for future use */
-			dprintf(("api", "bad flags %08x to Creat\n", domain));
-			err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
-			REALLYSETDCI4ERRNO(err->errnum, EINVAL);
-
-			return err;
-		}
 		s = socket(domain, type, protocol);
 		if (s == -1)
 		{
@@ -785,6 +792,10 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 		h->net.fd = s;
 		h->clientsocket = false;
 		*result = (int)h;
+	}
+	else
+	{
+		free_sslhandle(h);
 	}
 
 	return err;
@@ -834,16 +845,16 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
 			/* Copy session from source secure socket */
 			mbedtls_ssl_session_init(&sess);
 			mbederr = mbedtls_ssl_get_session(&src_h->ssl, &sess);
-				if (mbederr == 0)
-				{
-					mbederr = mbedtls_ssl_set_session(&h->ssl, &sess);
-			        mbedtls_ssl_session_free(&sess);
-				}
-				if ((mbederr == 0) &&
-				    ((hostname = mbedtls_ssl_get_hostname(&src_h->ssl)) != NULL))
-				{
-					mbederr = mbedtls_ssl_set_hostname(&h->ssl, hostname);
-				}
+			if (mbederr == 0)
+			{
+				mbederr = mbedtls_ssl_set_session(&h->ssl, &sess);
+			}
+			mbedtls_ssl_session_free(&sess);
+			if ((mbederr == 0) &&
+			    ((hostname = mbedtls_ssl_get_hostname(&src_h->ssl)) != NULL))
+			{
+				mbederr = mbedtls_ssl_set_hostname(&h->ssl, hostname);
+			}
 			if (mbederr != 0)
 			{
 				dprintf(("api", "ssl_setup returned %d\n", mbederr));
@@ -858,6 +869,10 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
 		h->net.fd = s;
 		h->clientsocket = true;
 		*result = (int)h;
+	}
+	else
+	{
+		free_sslhandle(h);
 	}
 
 	return err;
