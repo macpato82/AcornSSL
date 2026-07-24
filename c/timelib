@@ -24,7 +24,7 @@
  */
 #include <time.h>
 #include <stdint.h>
-#include <stdbool.h>
+#include "ro_bool.h"
 
 #include "mbedtls/x509.h"
 
@@ -56,12 +56,12 @@ static int leap_days_between(uint32_t y1, uint32_t y2)
 
 time_t x509_to_utc(const mbedtls_x509_time *in)
 {
-	static const uint16_t complete_months[] = { -1, /* 1's based months */
+	static const uint16_t complete_months[] = { 0,  /* 1's based months */
 	                                            0,   31,  59,  90,  120, 151,
 	                                            181, 212, 243, 273, 304, 334
 	                                          };
 	time_t   days, secs;
-	uint64_t sum;
+	unsigned __int64 sum;
 
 	/* No hope pre-epoch */
 	if (in->year < 1970) return (time_t)-1;
@@ -82,7 +82,7 @@ time_t x509_to_utc(const mbedtls_x509_time *in)
 	secs += in->sec;
 
 	/* Combine and worry about overflow */
-	sum = (86400uLL * days) + secs;
+	sum = ((unsigned __int64)86400 * days) + secs;
 	if ((time_t)sum != sum) return (time_t)-1;
 	return (time_t)sum;
 }

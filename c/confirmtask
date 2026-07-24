@@ -23,7 +23,7 @@
  * Use is subject to license terms.
  */
 #include <stdio.h>
-#include <stdbool.h>
+#include "ro_bool.h"
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
@@ -41,8 +41,7 @@
 #include "tboxlibs/wimplib.h"
 #include "tboxlibs/window.h"
 #include "tboxlibs/gadgets.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/x509_crt.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/base64.h"
 

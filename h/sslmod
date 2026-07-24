@@ -25,6 +25,8 @@
 #ifndef sslmod_h
 #define sslmod_h
 
+#include "ro_bool.h"
+
 #define MIN(a,b)  (((a)<(b))?(a):(b))
 #define MAX(a,b)  (((a)>(b))?(a):(b))
 #define UNUSED(k) (k)=(k)
@@ -73,7 +75,6 @@ _kernel_oserror *add_der_exception(const void *, size_t);
 _kernel_oserror *read_exceptions(void);
 const char *intl_lookup(const char *);
 const char *intl_integer(int32_t);
-_kernel_oserror *intl_errorbuff(sslmod_err_t, const char *, _kernel_oserror *);
 _kernel_oserror *intl_error(sslmod_err_t, const char *);
 
 #endif

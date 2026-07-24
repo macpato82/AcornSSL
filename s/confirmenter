@@ -29,7 +29,7 @@
         IMPORT  main
         EXPORT  sslmod_enter
 
-        AREA    |confirmenter$$Data|, DATA, NOINIT, READWRITE
+        AREA    |confirmenter$$Data|, DATA, NOINIT
 
         ; Our Wimp task's stack, put in the ZI region so it gets
         ; released along with all the other module workspace on finalisation
@@ -53,7 +53,7 @@ sslmod_enter
         ADD     sl, a4, #540            ; Stack limit clear of the relocation offsets
                                         ; so -536 and -540 pick them up
         MOV     fp, #0                  ; Stop backtrace here
-        ADD     sp, a4, #sslmod_appstacktop - sslmod_appstack
+        ADD     sp, a4, #16384
         Push    "a1"
         MOV     a2, sp                  ; Minimal valid argc and argv
         MOV     a1, #1

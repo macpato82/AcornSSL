@@ -1,0 +1,9 @@
+/* C90-compatible replacement for <stdbool.h> in the Norcroft AMU build. */
+#ifndef ACORNSSL_RO_BOOL_H
+#define ACORNSSL_RO_BOOL_H
+
+typedef int bool;
+#define false 0
+#define true 1
+
+#endif

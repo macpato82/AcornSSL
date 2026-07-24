@@ -26,7 +26,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdbool.h>
+#include "ro_bool.h"
 #include "swis.h"
 
 #include "Global/NewErrors.h"
@@ -44,10 +44,9 @@
 #include "sys/queue.h"
 #include "sys/stat.h"
 #include "tboxlibs/toolbox.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/x509_crt.h"
 #include "mbedtls/entropy.h"
-#include "mbedtls/md5.h"
+#include "mbedtls/sha256.h"
 
 #include "sslmod.h"
 #include "api.h"
@@ -66,7 +65,11 @@ static bool     callback_pending;
 static char    *exception_store;
 static size_t   exception_size;
 static char    *rootca_store;
-static size_t   rootca_area = -1;
+static int       rootca_area = -1;
+static bool      rootca_initialized;
+
+#define CERT_EXCEPTION_HASH_BYTES 32
+#define CERT_EXCEPTION_HASH_CHARS (CERT_EXCEPTION_HASH_BYTES * 2)
 
 /*
  * International support functions
@@ -99,24 +102,18 @@ const char *intl_integer(int32_t value)
 	return (const char *)string;
 }
 
-_kernel_oserror *intl_errorbuff(sslmod_err_t which, const char *extra, _kernel_oserror *buff)
+_kernel_oserror *intl_error(sslmod_err_t which, const char *extra)
 {
 	_kernel_oserror *err;
 	internaterr_t    msg_errblk;
 
-	/* Find the token and substitute any extra argument given */
+	/* Translate via MessageTrans' internal buffer */
 	sprintf(msg_errblk.errmess, "E%02x", which);
 	msg_errblk.errnum = which + ErrorBase_HTTPS;
 	err = _swix(MessageTrans_ErrorLookup, _INR(0,7),
-	            &msg_errblk, msgs_struct, buff, sizeof(*buff), extra, 0, 0, 0);
+	            &msg_errblk, msgs_struct, 0, 0, extra, 0, 0, 0);
 
 	return err;
-}
-
-_kernel_oserror *intl_error(sslmod_err_t which, const char *extra)
-{
-	/* Pass no buffer to use MessageTrans' internal buffer */
-	return intl_errorbuff(which, extra, NULL);
 }
 
 /*
@@ -124,9 +121,9 @@ _kernel_oserror *intl_error(sslmod_err_t which, const char *extra)
  */
 bool check_der_exception(const void *der, size_t dersize)
 {
-	uint8_t hash[16];
+	uint8_t hash[CERT_EXCEPTION_HASH_BYTES];
 	size_t  i;
-	char    match[(16 * 2)+1];
+	char    match[CERT_EXCEPTION_HASH_CHARS + 1];
 	const char *line;
 
 	if (exception_store == NULL)
@@ -136,7 +133,10 @@ bool check_der_exception(const void *der, size_t dersize)
 	}
 
 	/* Stringify the der to make comparison easier */
-	mbedtls_md5((const unsigned char *)der, dersize, hash);
+	if (mbedtls_sha256((const unsigned char *)der, dersize, hash, 0) != 0)
+	{
+		return false;
+	}
 	*match = '\0';
 	for (i = 0; i < sizeof(hash); i++)
 	{
@@ -150,13 +150,18 @@ bool check_der_exception(const void *der, size_t dersize)
 	line = exception_store;
 	while (*line)
 	{
-		if (memcmp(line, match, 16 * 2) == 0)
+		const char *end = strchr(line, '\n');
+		size_t length = (end == NULL) ? strlen(line) : (size_t)(end - line);
+
+		if ((length > 0) && (line[length - 1] == '\r')) length--;
+		if ((length == CERT_EXCEPTION_HASH_CHARS) &&
+		    (memcmp(line, match, CERT_EXCEPTION_HASH_CHARS) == 0))
 		{
 			/* It's in the list */
 			dprintf(("", "Right this way sir\n"));
 			return true;
 		}
-		line = strchr(line, '\n');
+		line = end;
 		if (line == NULL) break;
 		line++;
 	}
@@ -166,7 +171,7 @@ bool check_der_exception(const void *der, size_t dersize)
 
 _kernel_oserror *add_der_exception(const void *der, size_t dersize)
 {
-	uint8_t hash[16];
+	uint8_t hash[CERT_EXCEPTION_HASH_BYTES];
 	size_t  i;
 
 	/* Check for duplicates */
@@ -176,8 +181,11 @@ _kernel_oserror *add_der_exception(const void *der, size_t dersize)
 		size_t size;
 		bool   new = exception_store == NULL;
 
-		mbedtls_md5((const unsigned char *)der, dersize, hash);
-		size = exception_size + (2 * sizeof(hash)) + 1;
+		if (mbedtls_sha256((const unsigned char *)der, dersize, hash, 0) != 0)
+		{
+			return intl_error(ERR02_SSL_NO_INIT, NULL);
+		}
+		size = exception_size + CERT_EXCEPTION_HASH_CHARS + 1;
 		if (new) size++; /* For a null terminator */
 		dprintf(("", "Adding CertExcept exception, now %u bytes of store\n", size));
 		store = realloc(exception_store, size);
@@ -244,8 +252,12 @@ _kernel_oserror *read_exceptions(void)
 	dprintf(("", "Loading exceptions of %u bytes\n", size));
 	err = _swix(OS_File, _INR(0,3),
 	            OSFile_LoadNoPath, "Choices:WWW.AcornSSL.CertExcept", exception_store, 0);
-	if (err != NULL) destroy_exceptions();
-	exception_store[size - 1] = '\0';
+		if (err != NULL)
+		{
+			destroy_exceptions();
+			return err;
+		}
+		exception_store[size - 1] = '\0';
 
 	return NULL;
 }
@@ -255,6 +267,11 @@ _kernel_oserror *read_exceptions(void)
  */
 static void destroy_rootca(void)
 {
+	if (rootca_initialized)
+	{
+		mbedtls_x509_crt_free(&cacert_root);
+		rootca_initialized = false;
+	}
 	if (rootca_area != -1)
 	{
 		_swix(OS_DynamicArea, _INR(0,1), DAReason_Remove, rootca_area);
@@ -269,7 +286,7 @@ _kernel_oserror *read_rootca(void)
 	int      mbederr;
 	uint32_t size;
 	size_t   object;
-	static char area[32] = "";
+	static char area[32];
 
 	/* Read in the root CA (once), use the cached copy thereafter */
 	if (rootca_store != NULL)
@@ -286,6 +303,7 @@ _kernel_oserror *read_rootca(void)
 	}
 	dprintf(("", "Loading root CA of %u bytes\n", size));
 	size++; /* For a null terminator */
+	area[0] = '\0';
 	strncat(area, intl_lookup("Area"), sizeof(area) - 1);
 
 	/* Put them in an area so they're slightly less vulnerable than the RMA */
@@ -298,11 +316,16 @@ _kernel_oserror *read_rootca(void)
 	/* Load it and add the terminator */
 	err = _swix(OS_File, _INR(0,3),
 	            OSFile_LoadNoPath, "InetDBase:CertData", rootca_store, 0);
-	if (err != NULL) destroy_rootca();
+	if (err != NULL)
+	{
+		destroy_rootca();
+		return err;
+	}
 	rootca_store[size - 1] = '\0';
 
 	/* Prepare the library's X509 context */
 	mbedtls_x509_crt_init(&cacert_root);
+	rootca_initialized = true;
 	mbederr = mbedtls_x509_crt_parse(&cacert_root, (const unsigned char *)rootca_store, size);
 	dprintf(("", "X509 parse returned %d\n", mbederr));
 	if (mbederr < 0)
@@ -517,7 +540,7 @@ _kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
 			                 /* Out */ &r->r[0]);
 
 		case AcornSSL_Connect - AcornSSL_00:
-			return api_connect(/* In  */ r->r[0], (const struct sockaddr *)r->r[1], (socklen_t)r->r[2],
+			return api_connect(/* In  */ r->r[0], (const struct sockaddr *)r->r[1], r->r[2],
 			                   /* Out */ &r->r[0]);
 
 		case AcornSSL_Shutdown - AcornSSL_00:
@@ -529,7 +552,7 @@ _kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
 			                 /* Out */ &r->r[0]);
 
 		case AcornSSL_Getsockopt - AcornSSL_00:
-			return api_getsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (void *)r->r[3], (socklen_t *)r->r[4],
+			return api_getsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (void *)r->r[3], (int *)r->r[4],
 			                      /* Out */ &r->r[0]);
 
 		case AcornSSL_Write - AcornSSL_00:
@@ -545,15 +568,15 @@ _kernel_oserror *sslmod_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
 			                         /* Out */ &r->r[0]);
 
 		case AcornSSL_Getpeername - AcornSSL_00:
-			return api_getpeername(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (socklen_t *)r->r[2],
+			return api_getpeername(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (int *)r->r[2],
 			                       /* Out */ &r->r[0]);
 
 		case AcornSSL_Getsockname - AcornSSL_00:
-			return api_getsockname(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (socklen_t *)r->r[2],
+			return api_getsockname(/* In  */ r->r[0], (struct sockaddr *)r->r[1], (int *)r->r[2],
 			                       /* Out */ &r->r[0]);
 
 		case AcornSSL_Setsockopt - AcornSSL_00:
-			return api_setsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (const void *)r->r[3], (socklen_t)r->r[4],
+			return api_setsockopt(/* In  */ r->r[0], r->r[1], r->r[2], (const void *)r->r[3], r->r[4],
 			                      /* Out */ &r->r[0]);
 
 		case AcornSSL_Stat - AcornSSL_00:

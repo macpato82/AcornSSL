@@ -25,7 +25,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdbool.h>
+#include "ro_bool.h"
 #include <string.h>
 #include <time.h>
 #include "swis.h"
@@ -36,8 +36,7 @@
 
 #include "sys/queue.h"
 #include "tboxlibs/toolbox.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/x509_crt.h"
 #include "mbedtls/entropy.h"
 
 #include "sslmod.h"

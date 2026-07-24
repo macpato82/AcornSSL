@@ -23,12 +23,11 @@
  * Use is subject to license terms.
  */
 #include "Global/Services.h"
-#include "mbedTLS/ro_config.h"
 #include "VersionNum"
 
 title-string:           AcornSSL
 
-help-string:            AcornSSL Module_MajorVersion_CMHG MBEDTLS_VERSION_STRING_CMHG
+help-string:            AcornSSL 2.00 (Mbed TLS 4.1.0)
 
 date-string:            Module_Date_CMHG
 

@@ -23,7 +23,8 @@
  * Use is subject to license terms.
  */
 #include <stdlib.h>
-#include <stdbool.h>
+#include <stdarg.h>
+#include "ro_bool.h"
 #include <stdio.h>
 #include <string.h>
 #include "swis.h"
@@ -35,6 +36,7 @@
 #include "sys/types.h"
 #include "sys/socket.h"
 #include "sys/filio.h"
+#include "sys/fcntl.h"
 #include "sys/errno.h"
 #include "sys/queue.h"
 #include "sys/dcistructs.h"
@@ -44,7 +46,6 @@
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
-#include "mbedtls/oid.h"
 #include "mbedtls/ssl.h"
 
 #include "sslmod.h"
@@ -53,6 +54,45 @@
 #include "timelib.h"
 #include "AcornSSLHdr.h"
 #include "DebugLib/DebugLib.h"
+
+/*
+ * Mbed TLS uses fcntl() to switch sockets between blocking and non-blocking
+ * mode. RISC OS TCP/IP exposes the same operation through socketioctl(), so
+ * provide the small part of the POSIX interface required by net_sockets.c.
+ */
+static unsigned char acornssl_socket_nonblock[FD_SETSIZE];
+
+int fcntl(int fd, int cmd, ...)
+{
+	va_list args;
+	int flags;
+	int nonblock;
+	int result;
+
+	if (cmd == F_GETFL)
+	{
+		if (fd >= 0 && fd < (int)sizeof(acornssl_socket_nonblock) &&
+		    acornssl_socket_nonblock[fd] != 0)
+			return O_NONBLOCK;
+		return 0;
+	}
+
+	if (cmd == F_SETFL)
+	{
+		va_start(args, cmd);
+		flags = va_arg(args, int);
+		va_end(args);
+
+		nonblock = ((flags & O_NONBLOCK) != 0);
+		result = socketioctl(fd, FIONBIO, &nonblock);
+		if (result == 0 && fd >= 0 &&
+		    fd < (int)sizeof(acornssl_socket_nonblock))
+			acornssl_socket_nonblock[fd] = (unsigned char)nonblock;
+		return result;
+	}
+
+	return -1;
+}
 
 typedef struct
 {
@@ -76,19 +116,14 @@ typedef struct sslhandle_t
 	size_t      peekfrom;
 	size_t      peekto;
 
-	_kernel_oserror errbuff;  /* Safe copy of the last error on this handle */
-
 	confirm_t   confirm;      /* An unverified certificate awaits user */
 	uint32_t    confirmtime;  /* Time at which awaiting started */
 	uint32_t    confirmmax;   /* Maximum time to await */
 	size_t      confirmitt;   /* Number of times asked */
 	const certchain_t *confirmchain;
 	size_t      certs;        /* Depth of unverified certificates */
-	certpair_t  cert[MBEDTLS_X509_MAX_INTERMEDIATE_CA];
+	certpair_t  cert[MBEDTLS_X509_MAX_VERIFY_CHAIN_SIZE];
 	SLIST_ENTRY(sslhandle_t) list;
-
-	bool        session_valid;
-	mbedtls_ssl_session session;
 
 	uint32_t    guard;        /* Check word */
 #define API_GUARD        0x6465624D
@@ -159,6 +194,11 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 {
 	sslhandle_t *h = (sslhandle_t *)arg;
 
+	if ((depth < 0) || (depth >= MBEDTLS_X509_MAX_VERIFY_CHAIN_SIZE))
+	{
+		return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+	}
+
 	/* The authmode has been set to MBEDTLS_SSL_VERIFY_OPTIONAL which means
 	 * the handshake will proceed even if a link in the certificate chain is
 	 * unverified. This ensures this function is called for each link, which
@@ -198,7 +238,6 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 			certchain_t *anchor, *chain, *last;
 			char  temp[MBEDTLS_X509_MAX_DN_NAME_SIZE];
 			char *heap;
-			const char *alg;
 
 			/* At least one test failed for at least one certificate */
 			if (h->confirmmax == 0)
@@ -221,10 +260,6 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 			space = h->certs * common;
 			for (i = 0; i < h->certs; i++)
 			{
-				if (mbedtls_oid_get_sig_alg_desc(&h->cert[i].crt->sig_oid, &alg) != 0)
-				{
-					alg = "???";
-				}
 				space = space +
 				        sizeof(uint32_t) /* Version */ +
 				        sizeof(time_t) /* ValidFrom */ +
@@ -232,7 +267,9 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 				        mbedtls_x509_dn_gets(temp, sizeof(temp), &h->cert[i].crt->subject) +
 				        mbedtls_x509_dn_gets(temp, sizeof(temp), &h->cert[i].crt->issuer) +
 				        mbedtls_x509_serial_gets(temp, sizeof(temp), &h->cert[i].crt->serial) +
-				        strlen(alg) +
+				        mbedtls_x509_sig_alg_gets(temp, sizeof(temp), &h->cert[i].crt->sig_oid,
+				                                  h->cert[i].crt->sig_pk, h->cert[i].crt->sig_md,
+				                                  &h->cert[i].crt->sig_opts) +
 				        4 + 4 + 4 + 4 /* Terminate and align strings */;
 			}
 			anchor = malloc(space);
@@ -266,11 +303,9 @@ static int note_crt_sslhandle(void *arg, mbedtls_x509_crt *crt, int depth, uint3
 				len = mbedtls_x509_serial_gets(heap, sizeof(temp), &h->cert[i].crt->serial);
 				ADDTAG(tag, heap, len + 1, CertTag_Serial, CertTagType_String);
 
-				if (mbedtls_oid_get_sig_alg_desc(&h->cert[i].crt->sig_oid, &alg) != 0)
-				{
-					alg = "???";
-				}
-				len = strlen(strcpy(heap, alg));
+				len = mbedtls_x509_sig_alg_gets(heap, sizeof(temp), &h->cert[i].crt->sig_oid,
+				                                h->cert[i].crt->sig_pk, h->cert[i].crt->sig_md,
+				                                &h->cert[i].crt->sig_opts);
 				ADDTAG(tag, heap, len + 1, CertTag_Signature, CertTagType_String);
 
 				*(time_t *)heap = x509_to_utc(&h->cert[i].crt->valid_from);
@@ -300,6 +335,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 	_kernel_oserror *err;
 	int      mbederr;
 	uint32_t flags, now;
+	const char *hostname;
 
 	if (mbedtls_ssl_is_handshake_over(&h->ssl))
 	{
@@ -307,10 +343,19 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 		return NULL;
 	}
 
+	/* SNI and certificate hostname verification are inseparable. */
+	hostname = mbedtls_ssl_get_hostname(&h->ssl);
+	if ((hostname == NULL) || (*hostname == '\0'))
+	{
+		err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+		REALLYSETDCI4ERRNO(err->errnum, EINVAL);
+		return err;
+	}
+
 	if (!h->connected)
 	{
 		struct sockaddr_in peer;
-		socklen_t peersize = sizeof(peer);
+		int peersize = sizeof(peer);
 
 		if (getpeername(h->net.fd, (struct sockaddr *)&peer, &peersize) == -1)
 		{
@@ -370,7 +415,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 			}
 
 			/* Not there yet, fake a not connected error */
-			err = intl_errorbuff(ERR07_HANDSHAKE_ERROR, "-1", &h->errbuff);
+			err = intl_error(ERR07_HANDSHAKE_ERROR, "-1");
 			REALLYSETDCI4ERRNO(err->errnum, ENOTCONN);
 			return err;
 		}
@@ -380,7 +425,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 			    (mbederr != MBEDTLS_ERR_SSL_WANT_WRITE))
 			{
 				dprintf(("api", "ssl_handshake_step returned %d\n", mbederr));
-				err = intl_errorbuff(ERR07_HANDSHAKE_ERROR, intl_integer(-mbederr), &h->errbuff);
+				err = intl_error(ERR07_HANDSHAKE_ERROR, intl_integer(-mbederr));
 				if (mbederr == MBEDTLS_ERR_NET_CONN_RESET)
 				{
 					/* Fatal, map this to equivalent Unix error */
@@ -420,7 +465,7 @@ static _kernel_oserror *handshake_sslhandle(sslhandle_t *h)
 
 			dprintf(("api", "ssl_get_verify_result returned 0x%X\n", flags));
 			sprintf(hex, "0x%08X", flags);
-			return intl_errorbuff(ERR07_HANDSHAKE_ERROR, hex, &h->errbuff);
+			return intl_error(ERR07_HANDSHAKE_ERROR, hex);
 		}
 		dprintf(("api", "verify OK too\n"));
 	}
@@ -475,7 +520,7 @@ static _kernel_oserror *write_to_sslhandle(sslhandle_t *h, const char *buff, siz
 			{
 				dprintf(("api", "ssl_write returned %d\n", mbederr));
 				*result = -1;
-				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
 				break;
 			}
 
@@ -484,7 +529,7 @@ static _kernel_oserror *write_to_sslhandle(sslhandle_t *h, const char *buff, siz
 			{
 				dprintf(("api", "ssl_write would block\n"));
 				*result = -1;
-				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
 				REALLYSETDCI4ERRNO(err->errnum, EWOULDBLOCK);
 				break;
 			}
@@ -539,7 +584,7 @@ static _kernel_oserror *read_from_sslhandle(sslhandle_t *h, char *buff, size_t l
 			{
 				dprintf(("api", "ssl_read returned %d\n", mbederr));
 				*result = -1;
-				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
 				break;
 			}
 
@@ -548,7 +593,7 @@ static _kernel_oserror *read_from_sslhandle(sslhandle_t *h, char *buff, size_t l
 			{
 				dprintf(("api", "ssl_read would block\n"));
 				*result = -1;
-				err = intl_errorbuff(ERR06_SOCKET_ERROR, intl_integer(-mbederr), &h->errbuff);
+				err = intl_error(ERR06_SOCKET_ERROR, intl_integer(-mbederr));
 				REALLYSETDCI4ERRNO(err->errnum, EWOULDBLOCK);
 				break;
 			}
@@ -588,7 +633,7 @@ static _kernel_oserror *common_conf_sslhandle(sslhandle_t *h, bool client)
 	if (mbederr != 0)
 	{
 		dprintf(("api", "ssl_config_defaults returned %d\n", mbederr));
-		return intl_errorbuff(ERR02_SSL_NO_INIT, intl_integer(-mbederr), &h->errbuff);
+		return intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
 	}
 
 	/* Certificate checking config */
@@ -608,7 +653,7 @@ static _kernel_oserror *common_conf_sslhandle(sslhandle_t *h, bool client)
 	if (mbederr != 0)
 	{
 		dprintf(("api", "ssl_setup returned %d\n", mbederr));
-		return intl_errorbuff(ERR02_SSL_NO_INIT, intl_integer(-mbederr), &h->errbuff);
+		return intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
 	}
 
 	/* Hook up basic IO for the library to do handshake with */
@@ -624,13 +669,6 @@ static _kernel_oserror *free_sslhandle(sslhandle_t *h)
 	{
 		SLIST_REMOVE(&handles, h, sslhandle_t, list);
 		h->guard = API_GUARD_UNINIT;
-	}
-
-	/* Free session, if held */
-	if (h->session_valid)
-	{
-		mbedtls_ssl_session_free(&h->session);
-		h->session_valid = false;
 	}
 
 	/* Finalise each library sub component */
@@ -666,9 +704,6 @@ static _kernel_oserror *new_sslhandle(sslhandle_t **h)
 		new->peekbuffer = NULL;
 		new->peekspace = 0;
 		new->peekfrom = new->peekto = 0;
-
-		/* No session held */
-		new->session_valid = false;
 
 		/* Initialise each library sub component */
 		dprintf(("api", "initialise session at %p\n", (void *)new));
@@ -724,16 +759,6 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 	sslhandle_t     *h;
 	_kernel_oserror *err;
 
-	if ((domain >> CreateSession_FlagShift) & CreateSession_FlagMask)
-	{
-		/* All flags currently reserved for future use */
-		dprintf(("api", "bad flags %08x to Creat\n", domain));
-		err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
-		REALLYSETDCI4ERRNO(err->errnum, EINVAL);
-
-		return err;
-	}
-
 	err = new_sslhandle(&h);
 	if (err != NULL) return err;
 	err = common_conf_sslhandle(h, true);
@@ -741,6 +766,15 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 	{
 		int s;
 
+		if ((domain >> CreateSession_FlagShift) & CreateSession_FlagMask)
+		{
+			/* All flags currently reserved for future use */
+			dprintf(("api", "bad flags %08x to Creat\n", domain));
+			err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
+			REALLYSETDCI4ERRNO(err->errnum, EINVAL);
+
+			return err;
+		}
 		s = socket(domain, type, protocol);
 		if (s == -1)
 		{
@@ -751,10 +785,6 @@ _kernel_oserror *api_creat(int domain, int type, int protocol,
 		h->net.fd = s;
 		h->clientsocket = false;
 		*result = (int)h;
-	}
-	else
-	{
-		free_sslhandle(h);
 	}
 
 	return err;
@@ -791,28 +821,32 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
 	{
 		int          mbederr;
 		sslhandle_t *src_h;
+		const char  *hostname;
 
 		err = find_sslhandle(arg, &src_h);
 		if (err == NULL)
 		{
+			mbedtls_ssl_session sess;
+
 			/* Implicitly already accepted */
 			h->confirm = CONFIRM_ACCEPT;
 
-			/* Copy session from source secure socket to the new handle (once only) */
-			if (!src_h->session_valid)
-			{
-				mbedtls_ssl_session_init(&src_h->session);
-				mbederr = mbedtls_ssl_get_session(&src_h->ssl, &src_h->session);
-				src_h->session_valid = (mbederr == 0);
-			}
-			if (src_h->session_valid)
-			{
-				mbederr = mbedtls_ssl_set_session(&h->ssl, &src_h->session);
-			}
-
+			/* Copy session from source secure socket */
+			mbedtls_ssl_session_init(&sess);
+			mbederr = mbedtls_ssl_get_session(&src_h->ssl, &sess);
+				if (mbederr == 0)
+				{
+					mbederr = mbedtls_ssl_set_session(&h->ssl, &sess);
+			        mbedtls_ssl_session_free(&sess);
+				}
+				if ((mbederr == 0) &&
+				    ((hostname = mbedtls_ssl_get_hostname(&src_h->ssl)) != NULL))
+				{
+					mbederr = mbedtls_ssl_set_hostname(&h->ssl, hostname);
+				}
 			if (mbederr != 0)
 			{
-				dprintf(("api", "mbedtls_ssl_get/set_session returned %d\n", mbederr));
+				dprintf(("api", "ssl_setup returned %d\n", mbederr));
 				err = intl_error(ERR02_SSL_NO_INIT, intl_integer(-mbederr));
 			}
 		}
@@ -825,10 +859,6 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
 		h->clientsocket = true;
 		*result = (int)h;
 	}
-	else
-	{
-		free_sslhandle(h);
-	}
 
 	return err;
 }
@@ -840,7 +870,7 @@ _kernel_oserror *api_createsession(int s, uint32_t flags, int arg,
  * \param  result Pointer to return result as for Socket_Connect
  * \return Pointer to error block
  */
-_kernel_oserror *api_connect(int ext, const struct sockaddr *name, socklen_t namelen,
+_kernel_oserror *api_connect(int ext, const struct sockaddr *name, int namelen,
                              int *result)
 {
 	sslhandle_t     *h;
@@ -903,13 +933,14 @@ _kernel_oserror *api_close(int ext,
 {
 	sslhandle_t     *h;
 	_kernel_oserror *err;
+	int             fd;
 
 	err = find_sslhandle(ext, &h);
 	if (err == NULL)
 	{
+		fd = h->net.fd;
 		mbedtls_ssl_close_notify(&h->ssl);
-		*result = h->clientsocket ? 0
-		                          : socketclose(h->net.fd);
+		*result = h->clientsocket ? 0 : socketclose(fd);
 		if (*result == -1)
 		{
 			err = &_inet_error;
@@ -918,6 +949,9 @@ _kernel_oserror *api_close(int ext,
 		{
 			/* Also dispose of the memory associated with the handle */
 			dprintf(("api", "close of %p\n", (void *)h));
+			if (!h->clientsocket && fd >= 0 &&
+			    fd < (int)sizeof(acornssl_socket_nonblock))
+				acornssl_socket_nonblock[fd] = 0;
 			h->net.fd = -1;
 			err = free_sslhandle(h);
 		}
@@ -999,7 +1033,7 @@ _kernel_oserror *api_recv(int ext, char *buff, size_t len, int flags,
 			newbuffer = realloc(h->peekbuffer, len);
 			if (newbuffer == NULL)
 			{
-				return intl_errorbuff(ERR05_MALLOC, NULL, &h->errbuff);
+				return intl_error(ERR05_MALLOC, NULL);
 			}
 			else
 			{
@@ -1128,7 +1162,7 @@ _kernel_oserror *api_ioctl(int ext, unsigned long cmd, void *arg,
  * \param  result Pointer to return result as for Socket_Getpeername
  * \return Pointer to error block
  */
-_kernel_oserror *api_getpeername(int ext, struct sockaddr *name, socklen_t *namelen,
+_kernel_oserror *api_getpeername(int ext, struct sockaddr *name, int *namelen,
                                  int *result)
 {
 	sslhandle_t     *h;
@@ -1160,7 +1194,7 @@ _kernel_oserror *api_getpeername(int ext, struct sockaddr *name, socklen_t *name
  * \param  result Pointer to return result as for Socket_Getsockname
  * \return Pointer to error block
  */
-_kernel_oserror *api_getsockname(int ext, struct sockaddr *name, socklen_t *namelen,
+_kernel_oserror *api_getsockname(int ext, struct sockaddr *name, int *namelen,
                                  int *result)
 {
 	sslhandle_t     *h;
@@ -1194,7 +1228,7 @@ _kernel_oserror *api_getsockname(int ext, struct sockaddr *name, socklen_t *name
  * \param  result Pointer to return result as for Socket_Getsockopt
  * \return Pointer to error block
  */
-_kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, socklen_t *optlen,
+_kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, int *optlen,
                                 int *result)
 {
 	sslhandle_t     *h;
@@ -1206,15 +1240,15 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, s
 		if ((optname == SO_ACORNSSL_HOSTNAME) && (level == SOL_SOCKET))
 		{
 			/* Session host name */
-			if (*optlen != sizeof(const char *))
+			if (*optlen != sizeof(char *))
 			{
 				*result = -1;
-				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
 			}
 			else
 			{
 				*result = ESUCCESS;
-				*(const char **)optval = mbedtls_ssl_get_hostname(&h->ssl);
+				*(char **)optval = (char *)mbedtls_ssl_get_hostname(&h->ssl);
 			}
 			return err;
 		}
@@ -1224,7 +1258,7 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, s
 			if (*optlen != sizeof(uint32_t))
 			{
 				*result = -1;
-				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
 			}
 			else
 			{
@@ -1257,7 +1291,7 @@ _kernel_oserror *api_getsockopt(int ext, int level, int optname, void *optval, s
  * \param  result Pointer to return result as for Socket_Setsockopt
  * \return Pointer to error block
  */
-_kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *optval, socklen_t optlen,
+_kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *optval, int optlen,
                                 int *result)
 {
 	sslhandle_t     *h;
@@ -1271,10 +1305,11 @@ _kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *opt
 			int mbederr;
 
 			/* Session host name */
-			if (optlen != sizeof(const char *))
+			if ((optlen != sizeof(const char *)) || (optval == NULL) ||
+			    (*(const char *)optval == '\0'))
 			{
 				*result = -1;
-				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
 			}
 			else
 			{
@@ -1285,11 +1320,11 @@ _kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *opt
 					*result = -1;
 					if (mbederr == MBEDTLS_ERR_SSL_ALLOC_FAILED)
 					{
-						return intl_errorbuff(ERR05_MALLOC, NULL, &h->errbuff);
+						return intl_error(ERR05_MALLOC, NULL);
 					}
 
 					/* Treat everything else as invalid parameter */
-					err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
+					err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
 					REALLYSETDCI4ERRNO(err->errnum, EINVAL);
 				}
 			}
@@ -1301,7 +1336,7 @@ _kernel_oserror *api_setsockopt(int ext, int level, int optname, const void *opt
 			if (optlen != sizeof(uint32_t))
 			{
 				*result = -1;
-				err = intl_errorbuff(ERR08_PARAMETER_ERROR, intl_integer(EINVAL), &h->errbuff);
+				err = intl_error(ERR08_PARAMETER_ERROR, intl_integer(EINVAL));
 			}
 			else
 			{
