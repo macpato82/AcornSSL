@@ -1,12 +1,12 @@
 # AcornSSL for RISC OS
 
 AcornSSL is the RISC OS TLS module used by browser and network clients. This
-port is version 2.00 and is built against Mbed TLS 4.1.0.
+port is version 1.09 and is built against Mbed TLS 4.1.0.
 
 The module identifies itself as:
 
 ```text
-AcornSSL 2.00 (24 Jul 2026) (Mbed TLS 4.1.0)
+AcornSSL 1.09 (23 May 2026) (Mbed TLS 4.1.0)
 ```
 
 ## Enhancements and changes
@@ -45,3 +45,21 @@ riscos-amu MBEDTLSINC=-IC:mbedTLS MBEDTLSLIB=C:mbedTLS.o.mbedTLSzm-32
 ```
 
 The module build uses the project licence in `LICENCE`.
+
+## Runtime module order
+
+AcornSSL uses the `CryptRandom_Block` SWI when the CryptRandom module is
+available. It has a fallback entropy source, but systems using CryptRandom
+should load CryptRandom before AcornSSL during boot. CryptRandom 0.13 is
+installed as `System:Modules.CryptRand` and AcornSSL 1.09 as
+`System:Modules.Network.URL.AcornSSL`:
+
+```text
+RMEnsure CryptRandom 0.13 RMLoad System:Modules.CryptRand
+RMEnsure CryptRandom 0.13 Error CryptRandom 0.13 or later is required
+RMEnsure AcornSSL 1.09 RMLoad System:Modules.Network.URL.AcornSSL
+RMEnsure AcornSSL 1.09 Error AcornSSL 1.09 or later is required
+```
+
+Keep these lines in this order in the boot sequence. Loading AcornSSL before
+CryptRandom means its initialisation may use the fallback instead.

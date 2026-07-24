@@ -1,31 +1,59 @@
 REM >SSLCreateTest
-REM AcornSSL session-creation diagnostic
-ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+REM AcornSSL RISC OS 5 compatibility and implicit TLS diagnostic
+ON ERROR ERROR EXT ERR, REPORT$ + " at BASIC line " + STR$(ERL)
 
-PRINT "AcornSSL session creation diagnostic"
-SYS "XAcornSSL_Version" TO version%;flags%
-IF flags% AND 1 THEN
-  PRINT "AcornSSL_Version failed: ";$(version%+4)
-  END
-ENDIF
+host$="pop.gmail.com"
+port%=995
+af_inet%=2
+sock_stream%=1
+
+PRINT "AcornSSL RISC OS 5 diagnostic"
+
+REM Check the module.
+SYS "AcornSSL_Version" TO version%
 PRINT "Module version: ";version% / 100
 
-SYS "XAcornSSL_Creat",2,1,0 TO handle%;flags%
-IF flags% AND 1 THEN
-  PRINT "AcornSSL_Creat failed"
-  PRINT "  error: &";~(!handle%)
-  PRINT "  text : ";
-  SYS "OS_Write0",handle%+4
-  PRINT
-  END
+REM Resolve the POP3 server.
+SYS "Resolver_GetHostByName",0,host$ TO err%,hostent%
+IF hostent%!12<>4 THEN
+  ERROR 100,"Resolver returned a non-IPv4 address"
 ENDIF
 
-PRINT "AcornSSL_Creat succeeded, handle &";~handle%
-SYS "XAcornSSL_Close",handle% TO result%;flags%
-IF flags% AND 1 THEN
-  PRINT "AcornSSL_Close failed: ";
-  SYS "OS_Write0",result%+4
-  PRINT
-ELSE
-  PRINT "AcornSSL_Close succeeded"
-ENDIF
+ip4%=!!(hostent%!16)
+DIM sockaddr% 15
+REM Network byte order: AF_INET=2 -> 512, port 995 -> 58115.
+sockaddr%!0=512
+sockaddr%!2=58115
+sockaddr%!4=ip4%
+sockaddr%!8=0
+sockaddr%!12=0
+
+REM Port 995 is implicit TLS: create the secure socket first.
+SYS "AcornSSL_Creat",af_inet%,sock_stream%,0 TO ssl%
+PRINT "AcornSSL_Creat succeeded"
+
+REM Set SNI and certificate hostname before connecting.
+SYS "AcornSSL_Setsockopt",ssl%,&FFFF,&11E0,host$,4
+PRINT "Hostname configured"
+
+SYS "AcornSSL_Connect",ssl%,sockaddr%,16
+PRINT "AcornSSL_Connect succeeded to ";host$;":";port%
+
+DIM greeting% 4095
+tries%=0
+REPEAT
+  tries%=tries%+1
+  SYS "XAcornSSL_Recv",ssl%,greeting%,4095,0 TO received%;flags%
+  IF (flags% AND 1)=1 THEN
+    IF tries%>=100 THEN
+      PRINT "TLS receive failed after ";tries%;" attempts"
+      SYS "OS_Write0",received%+4
+      PRINT
+      END
+    ENDIF
+  ENDIF
+UNTIL (flags% AND 1)=0
+PRINT "TLS receive completed; received ";received%;" bytes"
+SYS "AcornSSL_Close",ssl%
+PRINT "SSL diagnostic complete"
+END
